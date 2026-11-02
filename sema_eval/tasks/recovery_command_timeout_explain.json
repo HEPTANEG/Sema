@@ -1,0 +1,18 @@
+{
+  "id": "recovery_command_timeout_explain_001",
+  "suite": "recovery",
+  "description": "Command failures should be explained instead of hidden.",
+  "input": "运行一个会失败的命令并解释结果。",
+  "permissions": {
+    "allow_run_commands": true
+  },
+  "expected": {
+    "required_tools": [
+      "run_command"
+    ],
+    "max_tool_calls": 1,
+    "final_answer_contains": [
+      "失败"
+    ]
+  }
+}

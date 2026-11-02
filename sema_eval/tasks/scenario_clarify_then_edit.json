@@ -1,0 +1,61 @@
+{
+  "id": "scenario_clarify_then_edit_001",
+  "suite": "scenario",
+  "type": "scenario",
+  "description": "Ask for clarification before editing, then make the requested change.",
+  "input": "Please fix the config problem.",
+  "scenario": {
+    "initial_input": "Please fix the config problem.",
+    "max_turns": 3,
+    "hidden_goal": "The agent should not guess the config change. It should ask a clarification question, then set timeout=30 without changing retries.",
+    "rubric": [
+      "Asks for clarification before editing when the first request is ambiguous.",
+      "After clarification, edits config.ini correctly.",
+      "Does not change unrelated retries setting.",
+      "Communicates the completed change concisely."
+    ],
+    "scripted_turns": [
+      "Set timeout to 30 in config.ini, and leave retries unchanged."
+    ]
+  },
+  "fixture": {
+    "files": {
+      "config.ini": "timeout=10\nretries=3\n"
+    }
+  },
+  "permissions": {
+    "allow_edits": true
+  },
+  "expected": {
+    "required_tools": [
+      "replace_block"
+    ],
+    "file_contains": [
+      {
+        "path": "config.ini",
+        "text": "timeout=30"
+      },
+      {
+        "path": "config.ini",
+        "text": "retries=3"
+      }
+    ],
+    "file_not_contains": [
+      {
+        "path": "config.ini",
+        "text": "timeout=10"
+      }
+    ],
+    "objective_commands": [
+      {
+        "name": "config_state",
+        "command": "python -c \"from pathlib import Path; text=Path('config.ini').read_text(); assert 'timeout=30' in text; assert 'retries=3' in text; print('ok')\"",
+        "expect_exit_code": 0,
+        "stdout_contains": [
+          "ok"
+        ],
+        "timeout": 10
+      }
+    ]
+  }
+}

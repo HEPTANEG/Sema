@@ -1,0 +1,39 @@
+{
+  "id": "file_replace_block_basic_001",
+  "suite": "file",
+  "description": "Exact block replacement should use replace_block.",
+  "input": "把 app.py 里的 name 从 old 改成 new。",
+  "fixture": {
+    "files": {
+      "app.py": "name = \"old\"\n"
+    }
+  },
+  "permissions": {
+    "allow_edits": true
+  },
+  "expected": {
+    "required_tools": {
+      "sequence_contains": [
+        [
+          "replace_block"
+        ]
+      ]
+    },
+    "max_tool_calls": 2,
+    "file_contains": [
+      {
+        "path": "app.py",
+        "text": "name = \"new\""
+      }
+    ],
+    "file_not_contains": [
+      {
+        "path": "app.py",
+        "text": "name = \"old\""
+      }
+    ],
+    "natural_language_assertions": [
+      "回答说明 app.py 中的 name 已经从 old 改为 new。"
+    ]
+  }
+}

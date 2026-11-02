@@ -1,0 +1,65 @@
+{
+  "id": "hard_cli_status_flag_001",
+  "suite": "hard",
+  "description": "Add a CLI flag while preserving existing behavior.",
+  "input": "Add a --status flag to app.py. Running python app.py --status should print ok. Existing --name behavior must still work.",
+  "fixture": {
+    "files": {
+      "app.py": "import argparse\n\n\ndef main():\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--name\", default=\"Sema\")\n    args = parser.parse_args()\n    print(f\"hello {args.name}\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+  "permissions": {
+    "allow_run_commands": true,
+    "allow_edits": true
+  },
+  "expected": {
+    "required_tools": {
+      "any_of": [
+        [
+          "write_file",
+          "replace_block",
+          "apply_patch"
+        ]
+      ],
+      "sequence_contains": [
+        [
+          "read_file",
+          "run_command"
+        ]
+      ]
+    },
+    "file_contains": [
+      {
+        "path": "app.py",
+        "text": "--status"
+      },
+      {
+        "path": "app.py",
+        "text": "ok"
+      }
+    ],
+    "objective_commands": [
+      {
+        "name": "status",
+        "command": "python app.py --status",
+        "expect_exit_code": 0,
+        "stdout_contains": [
+          "ok"
+        ],
+        "timeout": 10
+      },
+      {
+        "name": "name",
+        "command": "python app.py --name Ada",
+        "expect_exit_code": 0,
+        "stdout_contains": [
+          "hello Ada"
+        ],
+        "timeout": 10
+      }
+    ],
+    "natural_language_assertions": [
+      "Final answer summarizes both the new --status behavior and preserved --name behavior."
+    ]
+  }
+}

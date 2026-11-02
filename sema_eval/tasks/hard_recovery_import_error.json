@@ -1,0 +1,54 @@
+{
+  "id": "hard_recovery_import_error_001",
+  "suite": "hard",
+  "description": "Use a failing command result to repair an import error.",
+  "input": "Run the tests. If they fail, fix the import error and verify the tests pass.",
+  "fixture": {
+    "files": {
+      "app.py": "from helpers import format_name\n\n\ndef greeting(name):\n    return format_name(name)\n",
+      "helper.py": "def format_name(name):\n    return f\"hello {name}\"\n",
+      "test_app.py": "from app import greeting\n\n\ndef test_greeting():\n    assert greeting(\"Sema\") == \"hello Sema\"\n"
+    }
+  },
+  "permissions": {
+    "allow_run_commands": true,
+    "allow_edits": true
+  },
+  "expected": {
+    "required_tools": {
+      "sequence_contains": [
+        [
+          "run_command",
+          "replace_block",
+          "run_command"
+        ]
+      ]
+    },
+    "file_contains": [
+      {
+        "path": "app.py",
+        "text": "from helper import format_name"
+      }
+    ],
+    "file_not_contains": [
+      {
+        "path": "app.py",
+        "text": "from helpers import format_name"
+      }
+    ],
+    "objective_commands": [
+      {
+        "name": "pytest",
+        "command": "python -m pytest -q",
+        "expect_exit_code": 0,
+        "stdout_contains": [
+          "passed"
+        ],
+        "timeout": 30
+      }
+    ],
+    "natural_language_assertions": [
+      "Final answer mentions the import fix and test verification."
+    ]
+  }
+}

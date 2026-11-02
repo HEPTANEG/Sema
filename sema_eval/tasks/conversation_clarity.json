@@ -1,0 +1,17 @@
+{
+  "id": "conversation_clarity_001",
+  "suite": "conversation",
+  "description": "Final answer should be concise and actionable.",
+  "input": "我不懂 Agent evaluation（评估系统）是干嘛的，用两句话解释，不要解释 Python eval 函数。",
+  "expected": {
+    "forbidden_tools": [
+      "read_file",
+      "web_search",
+      "write_file"
+    ],
+    "natural_language_assertions": [
+      "回答解释 Agent evaluation 是用固定任务和统一标准评估 Agent 表现。",
+      "回答说明它能帮助发现改动后的进步或退化。"
+    ]
+  }
+}

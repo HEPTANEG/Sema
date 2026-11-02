@@ -1,0 +1,21 @@
+{
+  "id": "tool_run_command_for_version_001",
+  "suite": "tool",
+  "description": "Command output questions should route through run_command.",
+  "input": "运行 python --version 看当前 Python 版本。",
+  "permissions": {
+    "allow_run_commands": true
+  },
+  "expected": {
+    "required_tools": [
+      "run_command"
+    ],
+    "forbidden_tools": [
+      "write_file"
+    ],
+    "max_tool_calls": 1,
+    "final_answer_contains": [
+      "Python"
+    ]
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "id": "read_file_tool_routing_001",
+  "suite": "smoke",
+  "description": "Agent should use read_file before summarizing a workspace file.",
+  "input": "请读取 notes.txt，并用一句话总结它。",
+  "fixture": {
+    "files": {
+      "notes.txt": "Sema eval harness should capture tool calls and final answers.\n"
+    }
+  },
+  "expected": {
+    "required_tools": [
+      "read_file"
+    ],
+    "forbidden_tools": [
+      "write_file",
+      "run_command"
+    ],
+    "max_tool_calls": 2,
+    "natural_language_assertions": [
+      "回答准确总结 notes.txt 内容，说明 Sema eval harness 会捕获工具调用和最终回答。"
+    ]
+  }
+}

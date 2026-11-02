@@ -1,0 +1,15 @@
+{
+  "id": "conversation_asks_when_ambiguous_001",
+  "suite": "conversation",
+  "description": "Ambiguous requests should ask a focused clarification.",
+  "input": "帮我把它改好。",
+  "expected": {
+    "forbidden_tools": [
+      "write_file",
+      "run_command"
+    ],
+    "natural_language_assertions": [
+      "回答没有贸然修改文件，而是要求用户说明“它”指的目标文件、内容或具体修改要求。"
+    ]
+  }
+}

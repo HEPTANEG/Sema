@@ -1,0 +1,7 @@
+rich  # sema_eval optional Markdown console rendering; not a chat UI dependency
+pytest
+tiktoken
+pywin32
+python-telegram-bot>=22,<23
+sentence-transformers>=6,<7
+usearch>=2.26,<3

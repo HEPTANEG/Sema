@@ -1,0 +1,15 @@
+{
+  "id": "recovery_stop_after_repeated_missing_001",
+  "suite": "recovery",
+  "description": "Agent should stop after a missing context failure instead of guessing.",
+  "input": "读取 unknown.md。",
+  "expected": {
+    "required_tools": [
+      "read_file"
+    ],
+    "max_tool_calls": 2,
+    "natural_language_assertions": [
+      "回答说明 unknown.md 没有找到或无法读取，并要求用户提供其他路径或需求。"
+    ]
+  }
+}

@@ -1,0 +1,170 @@
+{
+  "id": "memory_engine_budget_shrink_watermark_001",
+  "suite": "memory_engine",
+  "type": "memory_engine",
+  "description": "Verify that shrinking STM budget advances WM ingress watermark and later budget expansion does not pull locked blocks back into STM.",
+  "input": "Seed several interaction blocks, stage and commit a low-budget WM ingress watermark, then inspect low- and high-budget snapshots.",
+  "fixture": {
+    "memory_engine": {
+      "operations": [
+        {
+          "type": "seed_messages",
+          "name": "seed",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Old block A: collect product requirements."
+            },
+            {
+              "role": "assistant",
+              "content_repeat": {
+                "text": "Requirement detail A: stable CLI behavior, safe workspace boundaries, reliable markdown reports. ",
+                "count": 80
+              }
+            },
+            {
+              "role": "user",
+              "content": "Old block B: collect implementation constraints."
+            },
+            {
+              "role": "assistant",
+              "content_repeat": {
+                "text": "Constraint detail B: no mock agent, external bridge, isolated workspace, structured artifacts. ",
+                "count": 80
+              }
+            },
+            {
+              "role": "user",
+              "content": "Latest block C: what is the next step?"
+            },
+            {
+              "role": "assistant",
+              "content": "Run the smallest white-box eval first."
+            }
+          ]
+        },
+        {
+          "type": "stage_wm_ingress",
+          "name": "shrink_commit",
+          "commit": true,
+          "context_pressure": {
+            "budget_source": "eval_fixture_low",
+            "scores": {},
+            "budgets": {
+              "stm_min": 200,
+              "stm_max": 200,
+              "stm": 200,
+              "stm_raw": 200,
+              "wm_min": 10000,
+              "wm_max": 50000,
+              "wm": 20000,
+              "wm_raw": 20000
+            },
+            "signals": {},
+            "stabilizer": {}
+          }
+        },
+        {
+          "type": "memory_snapshot",
+          "name": "after_shrink",
+          "context_pressure": {
+            "budget_source": "eval_fixture_low",
+            "scores": {},
+            "budgets": {
+              "stm_min": 200,
+              "stm_max": 200,
+              "stm": 200,
+              "stm_raw": 200,
+              "wm_min": 10000,
+              "wm_max": 50000,
+              "wm": 20000,
+              "wm_raw": 20000
+            },
+            "signals": {},
+            "stabilizer": {}
+          }
+        },
+        {
+          "type": "memory_snapshot",
+          "name": "after_expand",
+          "context_pressure": {
+            "budget_source": "eval_fixture_high",
+            "scores": {},
+            "budgets": {
+              "stm_min": 10000,
+              "stm_max": 50000,
+              "stm": 50000,
+              "stm_raw": 50000,
+              "wm_min": 10000,
+              "wm_max": 50000,
+              "wm": 20000,
+              "wm_raw": 20000
+            },
+            "signals": {},
+            "stabilizer": {}
+          }
+        }
+      ]
+    }
+  },
+  "expected": {
+    "memory_engine": {
+      "operations": [
+        {
+          "name": "shrink_commit",
+          "path": "result.commit_result.updated",
+          "equals": true
+        },
+        {
+          "name": "shrink_commit",
+          "path": "result.commit_result.effective_watermark",
+          "gte": 4
+        }
+      ],
+      "snapshot": [
+        {
+          "snapshot": "after_shrink",
+          "path": "context_preview.short_term_memory.omitted_blocks",
+          "contains_object": {
+            "kind": "interaction",
+            "start_index": 1,
+            "end_index": 2
+          }
+        },
+        {
+          "snapshot": "after_shrink",
+          "path": "wm_ingress.persisted_watermark",
+          "gte": 4
+        },
+        {
+          "snapshot": "after_expand",
+          "path": "context_preview.short_term_memory.omitted_blocks",
+          "contains_object": {
+            "kind": "interaction",
+            "start_index": 1,
+            "end_index": 2
+          }
+        },
+        {
+          "snapshot": "after_expand",
+          "path": "context_preview.short_term_memory.selected_blocks",
+          "contains_object": {
+            "kind": "interaction",
+            "start_index": 5,
+            "end_index": 6
+          }
+        },
+        {
+          "snapshot": "after_expand",
+          "path": "context_preview.short_term_memory.watermark_locked_omitted_block_count",
+          "gte": 2
+        },
+        {
+          "snapshot": "after_expand",
+          "path": "context_preview.short_term_memory.wm_ingress_watermark",
+          "gte": 4
+        }
+      ]
+    }
+  }
+}

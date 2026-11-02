@@ -1,0 +1,123 @@
+{
+  "id": "memory_engine_long_block_summarized_001",
+  "suite": "memory_engine",
+  "type": "memory_engine",
+  "description": "Verify that a long raw block leaving STM can be summarized into a SUM event while preserving original traceability.",
+  "input": "Seed a long old interaction, run Working Memory maintenance with a deterministic summarize decision, then inspect Observer metadata.",
+  "fixture": {
+    "memory_engine": {
+      "operations": [
+        {
+          "type": "seed_messages",
+          "name": "seed",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Please explain the F1 telemetry dashboard design in detail."
+            },
+            {
+              "role": "assistant",
+              "content_repeat": {
+                "text": "Telemetry design detail: lap delta, tyre degradation, stint phase, ERS usage, pit window risk, safety car sensitivity, weather caveat, driver comparison. ",
+                "count": 420
+              }
+            },
+            {
+              "role": "user",
+              "content": "Now switch to a short implementation note."
+            },
+            {
+              "role": "assistant",
+              "content": "Start with one lap chart and validate it against timing data."
+            }
+          ]
+        },
+        {
+          "type": "run_working_memory",
+          "name": "wm_summarize",
+          "force": true,
+          "decisions": [
+            {
+              "action": "summarize",
+              "summary": "F1 telemetry dashboard should track lap delta, tyre degradation, stint phase, ERS usage, pit risk, safety car/weather caveats, and driver comparison.",
+              "reason": "old long explanation is reusable but too large for working memory"
+            }
+          ]
+        },
+        {
+          "type": "memory_snapshot",
+          "name": "after_summary",
+          "context_pressure": {
+            "budget_source": "eval_fixture",
+            "scores": {},
+            "budgets": {
+              "stm_min": 10000,
+              "stm_max": 50000,
+              "stm": 10000,
+              "stm_raw": 10000,
+              "wm_min": 10000,
+              "wm_max": 50000,
+              "wm": 20000,
+              "wm_raw": 20000
+            },
+            "signals": {},
+            "stabilizer": {}
+          }
+        }
+      ]
+    }
+  },
+  "expected": {
+    "memory_engine": {
+      "operations": [
+        {
+          "name": "wm_summarize",
+          "path": "result.action",
+          "equals": "summarize"
+        },
+        {
+          "name": "wm_summarize",
+          "path": "result.summarized_count",
+          "gte": 1
+        }
+      ],
+      "snapshot": [
+        {
+          "snapshot": "after_summary",
+          "path": "storage.sum_event_count",
+          "gte": 1
+        },
+        {
+          "snapshot": "after_summary",
+          "path": "working_memory.sum_event_count",
+          "gte": 1
+        },
+        {
+          "snapshot": "after_summary",
+          "path": "working_memory.last_result.action",
+          "equals": "summarize"
+        },
+        {
+          "snapshot": "after_summary",
+          "path": "event_stream_slots",
+          "contains_object": {
+            "slot_seq": 2,
+            "active_kind": "sum",
+            "original_kind": "raw",
+            "active_event_id_equals_original": false
+          }
+        },
+        {
+          "snapshot": "after_summary",
+          "path": "context_preview.ok",
+          "equals": true
+        },
+        {
+          "snapshot": "after_summary",
+          "path": "context_preview.working_memory.selected_slot_seqs",
+          "contains": 2
+        }
+      ]
+    }
+  }
+}

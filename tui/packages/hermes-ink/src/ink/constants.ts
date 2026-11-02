@@ -1,0 +1,6 @@
+
+export const FRAME_INTERVAL_MS = 16
+
+
+
+export const BLURRED_FRAME_INTERVAL_MS = FRAME_INTERVAL_MS

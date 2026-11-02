@@ -1,0 +1,24 @@
+{
+  "id": "tool_list_before_answer_001",
+  "suite": "tool",
+  "description": "Directory questions should route through list_files.",
+  "input": "看看当前目录有哪些文件。",
+  "fixture": {
+    "files": {
+      "alpha.txt": "a\n",
+      "beta.txt": "b\n"
+    }
+  },
+  "expected": {
+    "required_tools": [
+      "list_files"
+    ],
+    "forbidden_tools": [
+      "write_file"
+    ],
+    "max_tool_calls": 1,
+    "final_answer_contains": [
+      "alpha.txt"
+    ]
+  }
+}

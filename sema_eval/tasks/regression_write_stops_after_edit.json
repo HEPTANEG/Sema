@@ -1,0 +1,33 @@
+{
+  "id": "regression_write_stops_after_edit_001",
+  "suite": "regression",
+  "description": "After a successful edit, the tool result should steer the model to stop and answer.",
+  "input": "把 config.txt 改成 enabled=true。",
+  "fixture": {
+    "files": {
+      "config.txt": "enabled=false\n"
+    }
+  },
+  "permissions": {
+    "allow_edits": true
+  },
+  "expected": {
+    "required_tools": {
+      "sequence_contains": [
+        [
+          "replace_block"
+        ]
+      ]
+    },
+    "max_tool_calls": 2,
+    "file_contains": [
+      {
+        "path": "config.txt",
+        "text": "enabled=true"
+      }
+    ],
+    "natural_language_assertions": [
+      "回答说明 config.txt 已经从 enabled=false 改为 enabled=true。"
+    ]
+  }
+}

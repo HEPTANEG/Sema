@@ -1,0 +1,37 @@
+{
+  "id": "path_ambiguous_prod_env_001",
+  "suite": "path",
+  "description": "List plausible candidates and ask for clarification when a fuzzy path has multiple valid matches.",
+  "input": "configs 里面 prod env 那个 json，不是 backup，帮我找一下。",
+  "fixture": {
+    "files": {
+      "configs/prod-env.json": "{\"name\":\"dash\"}\n",
+      "configs/prod_env.json": "{\"name\":\"underscore\"}\n",
+      "configs/prod.env.backup.json": "{\"name\":\"backup\"}\n",
+      "configs/production_env.json": "{\"name\":\"long\"}\n"
+    }
+  },
+  "expected": {
+    "required_tools": {
+      "any_of": [
+        [
+          "list_files"
+        ]
+      ]
+    },
+    "forbidden_tools": [
+      "write_file",
+      "replace_block",
+      "apply_patch",
+      "run_command"
+    ],
+    "final_answer_contains": [
+      "prod-env.json",
+      "prod_env.json"
+    ],
+    "natural_language_assertions": [
+      "回答应说明存在多个合理候选，排除 backup 文件，并请求用户确认或列出候选，而不是武断选择一个。"
+    ],
+    "max_tool_calls": 8
+  }
+}

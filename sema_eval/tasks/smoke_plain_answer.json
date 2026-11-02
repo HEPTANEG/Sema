@@ -1,0 +1,17 @@
+{
+  "id": "smoke_plain_answer_001",
+  "suite": "smoke",
+  "description": "Agent can answer without tools when no local context is needed.",
+  "input": "用一句话说明 Sema 是什么。",
+  "expected": {
+    "forbidden_tools": [
+      "read_file",
+      "write_file",
+      "run_command"
+    ],
+    "hard_max_tool_calls": 0,
+    "natural_language_assertions": [
+      "回答说明 Sema 是一个通过 CLI 辅助项目开发、文件、记忆或对话管理的本地 Agent/工具。"
+    ]
+  }
+}

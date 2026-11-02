@@ -1,0 +1,25 @@
+{
+  "id": "file_write_new_file_001",
+  "suite": "file",
+  "description": "New file creation should use write_file.",
+  "input": "创建 README.md，内容是一句 Sema eval demo。",
+  "permissions": {
+    "allow_edits": true
+  },
+  "expected": {
+    "required_tools": [
+      "write_file"
+    ],
+    "max_tool_calls": 3,
+    "file_contains": [
+      {
+        "path": "README.md",
+        "text": "Sema eval demo",
+        "case_sensitive": false
+      }
+    ],
+    "natural_language_assertions": [
+      "回答说明 README.md 已经创建，并且内容表达 Sema eval demo。"
+    ]
+  }
+}

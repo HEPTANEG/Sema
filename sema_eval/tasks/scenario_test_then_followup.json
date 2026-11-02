@@ -1,0 +1,66 @@
+{
+  "id": "scenario_test_then_followup_001",
+  "suite": "scenario",
+  "type": "scenario",
+  "description": "Handle a follow-up request to verify a completed edit.",
+  "input": "Fix the typo in message.txt.",
+  "scenario": {
+    "initial_input": "Fix the typo in message.txt: change helllo to hello.",
+    "max_turns": 3,
+    "hidden_goal": "The agent should fix the typo, then handle a follow-up asking it to verify the file content.",
+    "rubric": [
+      "Fixes the typo in the file.",
+      "Handles the follow-up by inspecting or otherwise verifying state.",
+      "Does not use unrelated memory or web tools.",
+      "Final communication is concise and grounded."
+    ],
+    "scripted_turns": [
+      "Please verify the file now contains hello."
+    ]
+  },
+  "fixture": {
+    "files": {
+      "message.txt": "helllo sema\n"
+    }
+  },
+  "permissions": {
+    "allow_edits": true
+  },
+  "expected": {
+    "required_tools": {
+      "sequence_contains": [
+        [
+          "replace_block",
+          "read_file"
+        ]
+      ]
+    },
+    "forbidden_tools": [
+      "add_memory",
+      "web_search"
+    ],
+    "file_contains": [
+      {
+        "path": "message.txt",
+        "text": "hello sema"
+      }
+    ],
+    "file_not_contains": [
+      {
+        "path": "message.txt",
+        "text": "helllo"
+      }
+    ],
+    "objective_commands": [
+      {
+        "name": "message_state",
+        "command": "python -c \"from pathlib import Path; assert Path('message.txt').read_text() == 'hello sema\\n'; print('ok')\"",
+        "expect_exit_code": 0,
+        "stdout_contains": [
+          "ok"
+        ],
+        "timeout": 10
+      }
+    ]
+  }
+}

@@ -1,0 +1,85 @@
+name: Bug report
+description: Report a reproducible defect in Sema
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. Do not include credentials, private conversations, personal paths, or other sensitive data. Security vulnerabilities must be reported privately through the repository Security page.
+  - type: input
+    id: version
+    attributes:
+      label: Sema version or commit
+      placeholder: 0.0.1 or a commit hash
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: input
+    id: runtimes
+    attributes:
+      label: Python and Node.js versions
+      placeholder: Python 3.12.x; Node.js 24.x
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Memory Engine
+        - Python Backend/Core
+        - TUI
+        - Bridge or protocol
+        - Tool execution or permissions
+        - Installation or setup
+        - Telegram remote control
+        - Search integration
+        - Evaluation or tests
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest sequence that consistently reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Include relevant errors or logs only after removing secrets and personal information.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched for an existing issue describing this behavior.
+          required: true
+        - label: I removed credentials, private content, and personal information.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

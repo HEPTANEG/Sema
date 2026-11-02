@@ -1,0 +1,146 @@
+{
+  "id": "memory_engine_need_context_retry_001",
+  "suite": "memory_engine",
+  "type": "memory_engine",
+  "description": "Verify that Working Memory need_context triggers bounded read-only evidence retrieval and then reaches a final decision.",
+  "input": "Seed an omitted candidate, force the first WM maintainer decision to need_context, then inspect evidence audit and final WM decision.",
+  "fixture": {
+    "memory_engine": {
+      "operations": [
+        {
+          "type": "seed_messages",
+          "name": "seed",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Context: compare two telemetry design alternatives before deciding what matters."
+            },
+            {
+              "role": "assistant",
+              "content_repeat": {
+                "text": "Ambiguous candidate detail: this depends on the surrounding comparison between fast prototype value and long-term maintainability. ",
+                "count": 620
+              }
+            },
+            {
+              "role": "user",
+              "content": "Latest turn: keep the next answer short."
+            },
+            {
+              "role": "assistant",
+              "content": "Use the prototype path first."
+            }
+          ]
+        },
+        {
+          "type": "run_working_memory",
+          "name": "wm_need_context",
+          "force": true,
+          "decisions": [
+            {
+              "action": "need_context",
+              "summary": "",
+              "reason": "single candidate lacks enough surrounding comparison"
+            },
+            {
+              "action": "keep_raw",
+              "summary": "",
+              "reason": "evidence shows the raw detail is still useful"
+            }
+          ]
+        },
+        {
+          "type": "memory_snapshot",
+          "name": "after_retry",
+          "context_pressure": {
+            "budget_source": "eval_fixture",
+            "scores": {},
+            "budgets": {
+              "stm_min": 10000,
+              "stm_max": 50000,
+              "stm": 10000,
+              "stm_raw": 10000,
+              "wm_min": 10000,
+              "wm_max": 50000,
+              "wm": 20000,
+              "wm_raw": 20000
+            },
+            "signals": {},
+            "stabilizer": {}
+          }
+        }
+      ]
+    }
+  },
+  "expected": {
+    "memory_engine": {
+      "operations": [
+        {
+          "name": "wm_need_context",
+          "path": "result.action",
+          "equals": "keep_raw"
+        },
+        {
+          "name": "wm_need_context",
+          "path": "result.kept_raw_count",
+          "gte": 1
+        },
+        {
+          "name": "wm_need_context",
+          "path": "result.summarized_count",
+          "equals": 0
+        }
+      ],
+      "snapshot": [
+        {
+          "snapshot": "after_retry",
+          "path": "evidence_audit",
+          "contains_object": {
+            "query_type": "expand_around",
+            "projection": "active",
+            "read_only": true,
+            "ok": true
+          }
+        },
+        {
+          "snapshot": "after_retry",
+          "path": "evidence_audit.0.result_count",
+          "gte": 1
+        },
+        {
+          "snapshot": "after_retry",
+          "path": "evidence_audit.0.error_count",
+          "equals": 0
+        },
+        {
+          "snapshot": "after_retry",
+          "path": "evidence_audit.0.max_chars",
+          "lte": 1200
+        },
+        {
+          "snapshot": "after_retry",
+          "path": "working_memory.last_result.action",
+          "one_of": [
+            "summarize",
+            "keep_raw"
+          ]
+        },
+        {
+          "snapshot": "after_retry",
+          "path": "wm_ingress.effective_watermark",
+          "equals": -1
+        },
+        {
+          "snapshot": "after_retry",
+          "path": "context.budget_stabilizer",
+          "equals": {}
+        },
+        {
+          "snapshot": "after_retry",
+          "path": "focus_segments.last_focus_prepare_result",
+          "equals": {}
+        }
+      ]
+    }
+  }
+}

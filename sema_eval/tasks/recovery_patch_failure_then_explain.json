@@ -1,0 +1,28 @@
+{
+  "id": "recovery_edit_failure_then_explain_001",
+  "suite": "recovery",
+  "description": "Bad edit context should lead to a clear recovery explanation.",
+  "input": "把 app.py 里不存在的 old_value 改掉。",
+  "fixture": {
+    "files": {
+      "app.py": "print('hello')\n"
+    }
+  },
+  "permissions": {
+    "allow_edits": true
+  },
+  "expected": {
+    "required_tools": {
+      "any_of": [
+        [
+          "replace_block",
+          "read_file"
+        ]
+      ]
+    },
+    "max_tool_calls": 2,
+    "natural_language_assertions": [
+      "回答清楚说明 app.py 中没有 old_value 或目标上下文不存在，需要用户提供正确旧值和新值。"
+    ]
+  }
+}

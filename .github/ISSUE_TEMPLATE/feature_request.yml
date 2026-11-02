@@ -1,0 +1,60 @@
+name: Feature request
+description: Propose an improvement by describing the problem it should solve
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests are welcome, but they are not automatically added to the project ToDo list and implementation is not guaranteed.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Memory Engine
+        - Python Backend/Core
+        - TUI
+        - Bridge or protocol
+        - Tool execution or permissions
+        - Installation or setup
+        - Telegram remote control
+        - Search integration
+        - Evaluation or tests
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user or developer problem without assuming a particular implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the observable result you would like.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: impact
+    attributes:
+      label: Compatibility, privacy, or security impact
+      description: Note new services, credentials, data handling, dependencies, or platform requirements.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched for an existing request covering this problem.
+          required: true
+        - label: I understand that this request is not automatically part of the project roadmap.
+          required: true

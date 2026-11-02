@@ -1,0 +1,38 @@
+{
+  "id": "file_edit_basic_001",
+  "suite": "smoke",
+  "description": "Agent should edit one file and stop after a successful write.",
+  "input": "把 app.py 里的 greeting 改成 hello sema。",
+  "fixture": {
+    "files": {
+      "app.py": "greeting = \"hello\"\n"
+    }
+  },
+  "permissions": {
+    "allow_edits": true
+  },
+  "expected": {
+    "required_tools": [
+      "replace_block"
+    ],
+    "forbidden_tools": [
+      "run_command"
+    ],
+    "max_tool_calls": 2,
+    "final_answer_contains": [
+      "hello sema"
+    ],
+    "file_contains": [
+      {
+        "path": "app.py",
+        "text": "greeting = \"hello sema\""
+      }
+    ],
+    "file_not_contains": [
+      {
+        "path": "app.py",
+        "text": "greeting = \"hello\"\n"
+      }
+    ]
+  }
+}

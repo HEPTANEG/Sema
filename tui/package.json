@@ -1,0 +1,40 @@
+{
+  "name": "sema-tui",
+  "version": "0.0.1",
+  "private": true,
+  "license": "MIT AND Apache-2.0",
+  "type": "module",
+  "bin": {
+    "sema-tui": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.tsx",
+    "clean": "node -e \"require('fs').rmSync('dist', {recursive: true, force: true})\"",
+    "build:hermes": "npm --prefix packages/hermes-ink run build",
+    "prebuild": "npm run clean && npm run build:hermes",
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@hermes/ink": "file:packages/hermes-ink",
+    "@nanostores/react": "^1.1.0",
+    "@types/node-notifier": "^8.0.5",
+    "ink": "^6.8.0",
+    "ink-text-input": "^6.0.0",
+    "nanostores": "^1.2.0",
+    "node-notifier": "^10.0.1",
+    "react": "^19.2.0",
+    "signal-exit": "^4.1.0",
+    "unicode-animations": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/react": "^19.0.0",
+    "tsx": "^4.7.1",
+    "typescript": "^5.4.3",
+    "vitest": "^1.4.0"
+  },
+  "engines": {
+    "node": ">=24 <25"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "id": "path_fuzzy_unique_nested_001",
+  "suite": "path",
+  "description": "Resolve a fuzzy natural-language path when several similar directories exist but one target is correct.",
+  "input": "Archive 里那个中文名“张淼”的文件夹，里面 9_ 下的 9__1，帮我找到这个文件，不用读取内容。",
+  "fixture": {
+    "files": {
+      "Archive/Zhang_Miao/9_/9__1.png": "wrong romanized candidate\n",
+      "Archive/Zhang-Miao/9/9_1.png": "wrong separator candidate\n",
+      "Archive/ZhangMiao/09_/9__1_backup.png": "wrong backup candidate\n",
+      "Archive/张淼/9_/9__1.png": "target image placeholder\n"
+    }
+  },
+  "expected": {
+    "required_tools": {
+      "any_of": [
+        [
+          "list_files"
+        ]
+      ]
+    },
+    "forbidden_tools": [
+      "write_file",
+      "replace_block",
+      "apply_patch",
+      "run_command"
+    ],
+    "final_answer_contains": [
+      "张淼",
+      "9_",
+      "9__1.png"
+    ],
+    "max_tool_calls": 8
+  }
+}

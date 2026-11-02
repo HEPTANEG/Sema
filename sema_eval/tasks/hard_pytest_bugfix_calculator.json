@@ -1,0 +1,61 @@
+{
+  "id": "hard_pytest_bugfix_calculator_001",
+  "suite": "hard",
+  "description": "Fix a small Python bug and verify it with pytest.",
+  "input": "The calculator tests are failing. Inspect the project, fix the bug, and run the tests.",
+  "fixture": {
+    "files": {
+      "calculator.py": "def add(a, b):\n    return a - b\n\n\ndef multiply(a, b):\n    return a * b\n",
+      "test_calculator.py": "from calculator import add, multiply\n\n\ndef test_add():\n    assert add(2, 3) == 5\n\n\ndef test_multiply():\n    assert multiply(4, 3) == 12\n"
+    }
+  },
+  "permissions": {
+    "allow_run_commands": true,
+    "allow_edits": true
+  },
+  "expected": {
+    "required_tools": {
+      "any_of": [
+        [
+          "read_file",
+          "list_files"
+        ]
+      ],
+      "sequence_contains": [
+        [
+          "replace_block",
+          "run_command"
+        ]
+      ]
+    },
+    "forbidden_tools": [
+      "add_memory"
+    ],
+    "file_contains": [
+      {
+        "path": "calculator.py",
+        "text": "return a + b"
+      }
+    ],
+    "file_not_contains": [
+      {
+        "path": "calculator.py",
+        "text": "return a - b"
+      }
+    ],
+    "objective_commands": [
+      {
+        "name": "pytest",
+        "command": "python -m pytest -q",
+        "expect_exit_code": 0,
+        "stdout_contains": [
+          "passed"
+        ],
+        "timeout": 30
+      }
+    ],
+    "natural_language_assertions": [
+      "Final answer says the bug was fixed and mentions test verification."
+    ]
+  }
+}

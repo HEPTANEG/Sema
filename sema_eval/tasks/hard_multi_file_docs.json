@@ -1,0 +1,52 @@
+{
+  "id": "hard_multi_file_docs_001",
+  "suite": "hard",
+  "description": "Update related docs in two files with consistent commands.",
+  "input": "Update the docs so README.md and docs/usage.md both say the test command is python -m pytest -q.",
+  "fixture": {
+    "files": {
+      "README.md": "# Demo\n\nRun tests with pytest.\n",
+      "docs/usage.md": "# Usage\n\nTest command: pytest\n"
+    }
+  },
+  "permissions": {
+    "allow_edits": true
+  },
+  "expected": {
+    "required_tools": {
+      "any_of": [
+        [
+          "replace_block",
+          "write_file"
+        ]
+      ]
+    },
+    "forbidden_tools": [
+      "run_command"
+    ],
+    "file_contains": [
+      {
+        "path": "README.md",
+        "text": "python -m pytest -q"
+      },
+      {
+        "path": "docs/usage.md",
+        "text": "python -m pytest -q"
+      }
+    ],
+    "objective_commands": [
+      {
+        "name": "docs_consistent",
+        "command": "python -c \"from pathlib import Path; assert 'python -m pytest -q' in Path('README.md').read_text(); assert 'python -m pytest -q' in Path('docs/usage.md').read_text(); print('ok')\"",
+        "expect_exit_code": 0,
+        "stdout_contains": [
+          "ok"
+        ],
+        "timeout": 10
+      }
+    ],
+    "natural_language_assertions": [
+      "Final answer names both updated files and the new test command."
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "file_insert_after_basic_001",
+  "suite": "file",
+  "description": "Pure line insertion should use insert_after.",
+  "input": "在 settings.py 的 DEBUG 后面添加 LOG_LEVEL。",
+  "fixture": {
+    "files": {
+      "settings.py": "DEBUG = True\n"
+    }
+  },
+  "permissions": {
+    "allow_edits": true
+  },
+  "expected": {
+    "required_tools": {
+      "sequence_contains": [
+        [
+          "insert_after"
+        ]
+      ]
+    },
+    "max_tool_calls": 2,
+    "file_contains": [
+      {
+        "path": "settings.py",
+        "text": "LOG_LEVEL"
+      }
+    ],
+    "natural_language_assertions": [
+      "回答说明已经在 settings.py 中添加 LOG_LEVEL 配置。"
+    ]
+  }
+}

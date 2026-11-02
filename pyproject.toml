@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sema-eval"
+version = "0.0.1"
+description = "External benchmark harness for Sema"
+readme = "sema_eval/README.md"
+requires-python = ">=3.11,<3.13"
+
+[project.scripts]
+sema-eval = "sema_eval.main:main"
+
+[tool.setuptools]
+packages = ["sema_eval", "sema_eval.benchmarks"]
+
+[tool.setuptools.package-data]
+sema_eval = [
+    "tasks/*.json",
+]

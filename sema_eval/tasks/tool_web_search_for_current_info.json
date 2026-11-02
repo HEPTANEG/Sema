@@ -1,0 +1,18 @@
+{
+  "id": "tool_web_search_for_current_info_001",
+  "suite": "tool",
+  "description": "Current external information should route through web_search.",
+  "input": "查一下今天的 AI 新闻摘要。",
+  "expected": {
+    "required_tools": [
+      "web_search"
+    ],
+    "forbidden_tools": [
+      "write_file"
+    ],
+    "max_tool_calls": 2,
+    "natural_language_assertions": [
+      "回答基于搜索结果处理今日 AI 新闻摘要；如果搜索环境不可用，应清楚说明环境限制。"
+    ]
+  }
+}
