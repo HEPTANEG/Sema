@@ -39,6 +39,59 @@ def test_staged_maintenance_runs_all_semantic_stages_and_wakes(isolated_workspac
     assert maintenance_digest_cache.load_latest_staged_summary(isolated_workspace) is not None
 
 
+def test_maintenance_completion_uses_task_resume_wake_when_continuation_exists():
+    wakes = []
+    runtime_state = {
+        "wake_callback": lambda *args, **kwargs: wakes.append((args, kwargs)) or True,
+        "maintenance_continuation": {
+            "status": "running",
+            "continuation_id": "continuation-1",
+            "wake_prompt": "Resume the documentation study at section 8.",
+            "parent_request_id": "request-42",
+        },
+    }
+
+    assert maintenance_runner._enqueue_maintenance_wake(runtime_state, "maintenance-run-1", "summary", {"status": "written"}) is True
+
+    assert wakes[0][0][:2] == ("maintainer", "maintenance_task_resumed")
+    assert wakes[0][0][2]["wake_prompt"] == "Resume the documentation study at section 8."
+    assert "maintenance_summary" not in wakes[0][0][2]
+    assert wakes[0][0][2]["maintenance_summary_status"] == "written"
+    assert wakes[0][0][2]["parent_request_id"] == "request-42"
+    assert wakes[0][1]["wake_id"] == "wake_maintenance_resume_continuation-1_maintenance-run-1"
+
+
+def test_maintenance_wake_queue_rejection_is_not_reported_as_queued(monkeypatch):
+    recorded = []
+
+    def capture_event(*args, **kwargs):
+        recorded.append((args, kwargs))
+
+    monkeypatch.setattr(maintenance_runner, "record_event", capture_event)
+    runtime_state = {
+        "wake_enqueue_status_callback": lambda *_args, **_kwargs: "rejected_duplicate_session",
+        "_ltm_maintenance_trajectory_context": {"trajectory_id": "trajectory-1"},
+    }
+
+    assert maintenance_runner._enqueue_maintenance_wake(runtime_state, "run-1", "summary", {"status": "written"}) is False
+    event_types = [entry[0][1] for entry in recorded]
+    assert "maintenance.wake_failed" in event_types
+    assert "maintenance.wake_queued" not in event_types
+
+
+def test_maintenance_wake_already_delivered_is_reported_as_accepted(monkeypatch):
+    recorded = []
+    monkeypatch.setattr(maintenance_runner, "record_event", lambda *args, **kwargs: recorded.append((args, kwargs)))
+    runtime_state = {
+        "wake_enqueue_status_callback": lambda *_args, **_kwargs: "already_delivered",
+        "_ltm_maintenance_trajectory_context": {"trajectory_id": "trajectory-1"},
+    }
+
+    assert maintenance_runner._enqueue_maintenance_wake(runtime_state, "run-1", "summary", {"status": "written"}) is True
+    assert [event[0][1] for event in recorded] == ["maintenance.wake_queued"]
+    assert recorded[0][1]["summary"]["queue_status"] == "already_delivered"
+
+
 def test_staged_maintenance_requires_relevant_evidence(isolated_workspace, monkeypatch):
     responses = [
         _response([_call("complete_maintenance_stage", {"stage": "recent_review", "status": "completed", "stage_summary": "No change."}, "stage")]),

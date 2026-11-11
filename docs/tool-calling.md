@@ -26,6 +26,14 @@ owns tool dispatch, permission classification, confirmation, and execution.
 - When LTM is available, `get_object` and `retrieve_memory` provide explicit
   Long-Term Memory recall, and `memorize` provides the durable memory-write
   interface.
+- Runtime maintenance-control tools are converted by the same adapter as
+  ordinary structured tools. `sleep_for_maintenance` requires `wake_prompt`,
+  `retry_ltm_maintenance` takes an empty argument object, and
+  `return_maintenance_failure` requires a user-facing `message`.
+- Maintainer `abstract` supports two contracts: `tagged_with` creates a Tag
+  from any live MemoryObject sources; `supports` creates an assertion from
+  assertion or episode sources. Episodes are created with `create_object` and
+  linked to Event Stream slots using `sourced_from`.
 
 ## Security and Confirmation
 

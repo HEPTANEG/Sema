@@ -1,5 +1,5 @@
 import {afterEach, expect, it, vi} from 'vitest';
-import {$activeView, $config, $settings, applyConfigUpdates, closeActiveView, returnToSettings} from './runtime.js';
+import {$activeView, $config, $model, $settings, applyConfigUpdates, closeActiveView, returnToSettings} from './runtime.js';
 import type {BridgeClient} from '../protocol/client.js';
 import {resetNotificationsForTests, setNotifierForTests} from '../notifications.js';
 
@@ -26,4 +26,10 @@ it('reports a failed config save without closing the editor', async () => {
   expect(await applyConfigUpdates(client, {model: 'new'})).toBe(false);
   expect($activeView.get()).toBe('config');
   expect($config.get()).toEqual({config: {model: 'saved'}});
+});
+
+it('updates the chat model label after a successful config save', async () => {
+  const client = {updateConfig: vi.fn().mockResolvedValue({config: {provider: 'deepseek', model: 'deepseek-flash'}})} as unknown as BridgeClient;
+  expect(await applyConfigUpdates(client, {model: 'deepseek-flash'})).toBe(true);
+  expect($model.get()).toBe('deepseek:deepseek-flash');
 });

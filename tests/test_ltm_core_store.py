@@ -111,7 +111,7 @@ def test_ltm_store_can_opt_into_real_vector_staging_path(isolated_workspace, mon
     monkeypatch.setattr(
         vector_index,
         "stage_object_upserts",
-        lambda objects, root=None: calls.append((objects, root)) or None,
+        lambda objects, root=None, timeout_seconds=None: calls.append((objects, root, timeout_seconds)) or None,
     )
 
     result = ltm_store.commit_write_plan(_plan(_id("c")), "real-vector-staging-path", isolated_workspace)
@@ -128,12 +128,47 @@ def test_payload_thresholds_are_byte_based(isolated_workspace):
     assert small["valid"]
     missing = ltm_store.validate_write_plan(_plan(body="x" * 2049))
     assert not missing["valid"]
-    assert any(error["code"] == "missing_summary" for error in missing["errors"])
+    missing_error = next(error for error in missing["errors"] if error["code"] == "missing_summary")
+    assert missing_error["actual_payload_bytes"] == 2049
+    assert missing_error["summary_threshold_bytes"] == ltm_store.SUMMARY_THRESHOLD_BYTES
+    assert missing_error["max_payload_bytes"] == ltm_store.SPLIT_THRESHOLD_BYTES
     medium = ltm_store.validate_write_plan(_plan(body="x" * 2049, summary="compressed"))
     assert medium["valid"]
     huge = ltm_store.validate_write_plan(_plan(body="x" * 8193, summary="compressed"))
     assert not huge["valid"]
+    huge_error = next(error for error in huge["errors"] if error["code"] == "payload_too_large")
+    assert huge_error["actual_payload_bytes"] == 8193
     assert any(error["code"] == "payload_too_large" for error in huge["errors"])
+
+
+@pytest.mark.parametrize("structured_data,expected_code", [
+    ({"unknown": True}, "episode_schema"),
+    ({"time_scope": None}, "time_scope"),
+    ({"time_scope": {}}, "empty_time_scope"),
+    ({"time_scope": {"start": "2026", "unexpected": "x"}}, "time_scope_fields"),
+    ({"time_scope": {"start": "2026", "precision": "bad"}}, "time_scope_precision"),
+])
+def test_episode_structured_data_rejects_invalid_shapes(isolated_workspace, structured_data, expected_code):
+    from memory_engine import event_stream
+    from memory_engine.ltm import ltm_store
+
+    _seed_stream(isolated_workspace)
+    plan = _plan(object_type="episode")
+    plan["objects"][0]["payload"]["structured_data"] = structured_data
+    result = ltm_store.validate_write_plan(plan, root=isolated_workspace)
+    assert not result["valid"]
+    assert expected_code in {error["code"] for error in result["errors"]}
+
+
+def test_episode_structured_data_accepts_null_empty_and_time_scope(isolated_workspace):
+    from memory_engine.ltm import ltm_store
+
+    _seed_stream(isolated_workspace)
+    for index, structured_data in enumerate((None, {}, {"time_scope": {"start": "2026", "precision": "approximate"}})):
+        plan = _plan(_id(chr(ord("a") + index)), object_type="episode")
+        plan["objects"][0]["payload"]["structured_data"] = structured_data
+        result = ltm_store.validate_write_plan(plan, root=isolated_workspace)
+        assert result["valid"], result
 
 
 def test_provenance_validation_is_read_only_and_atomic(isolated_workspace):
@@ -174,6 +209,8 @@ def test_sourced_from_rejects_memory_object_targets(isolated_workspace):
     )
     assert result["status"] == "rejected"
     assert result["errors"][0]["code"] == "relation_contract"
+    assert result["errors"][0]["details"]["expected"]["target"] == ["event_slot"]
+    assert result["errors"][0]["details"]["actual"]["target"] == "assertion"
 
 
 def test_idempotency_survives_reopen_and_conflict_is_rejected(isolated_workspace):

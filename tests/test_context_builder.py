@@ -26,22 +26,34 @@ def _fake_stm_projection():
         ],
         "budget": 10000,
         "selected_tokens": 10,
-        "selected_blocks": [
+        "selected_units": [
             {
-                "kind": "interaction",
-                "messages": [_message("user", "latest user"), _message("assistant", "latest assistant")],
+                "kind": "user",
+                "messages": [_message("user", "latest user")],
                 "start_index": 5,
+                "end_index": 5,
+                "message_count": 1,
+                "token_count": 5,
+            },
+            {
+                "kind": "assistant",
+                "messages": [_message("assistant", "latest assistant")],
+                "start_index": 6,
                 "end_index": 6,
-                "message_count": 2,
-                "token_count": 10,
-            }
+                "message_count": 1,
+                "token_count": 5,
+            },
         ],
-        "omitted_blocks": [
-            {"kind": "interaction", "start_index": 1, "end_index": 2, "message_count": 2, "token_count": 10},
-            {"kind": "interaction", "start_index": 3, "end_index": 4, "message_count": 2, "token_count": 10},
+        "omitted_units": [
+            {"kind": "user", "start_index": 1, "end_index": 1, "message_count": 1, "token_count": 5},
+            {"kind": "assistant", "start_index": 2, "end_index": 2, "message_count": 1, "token_count": 5},
+            {"kind": "user", "start_index": 3, "end_index": 3, "message_count": 1, "token_count": 5},
+            {"kind": "assistant", "start_index": 4, "end_index": 4, "message_count": 1, "token_count": 5},
         ],
-        "latest_block_tokens": 10,
-        "total_blocks": 3,
+        "latest_unit_tokens": 5,
+        "total_units": 6,
+        "wm_ingress_watermark": -1,
+        "watermark_locked_omitted_unit_count": 0,
     }
 
 
@@ -50,10 +62,10 @@ def _fake_pressure(stm=10000, wm=6000):
         "budget_source": "dynamic",
         "scores": {"I": 0.1, "S": 0.2, "R": 0.0, "P_context": 0.1},
         "budgets": {
-            "stm_min": 10000,
+            "stm_min": 1000,
             "stm_max": 50000,
             "stm": stm,
-            "wm_min": 10000,
+            "wm_min": 1000,
             "wm_max": 50000,
             "wm": wm,
         },
@@ -78,6 +90,36 @@ def test_context_builder_orders_system_wm_then_stm(isolated_workspace, monkeypat
     assert context["messages"][1]["content"].startswith("<working-memory>")
     assert context["messages"][2:] == [_message("user", "latest user"), _message("assistant", "latest assistant")]
     assert "LTM" not in context["messages"][1]["content"]
+
+
+def test_context_builder_skips_diagnostic_memory_push_content(isolated_workspace, monkeypatch):
+    import memory_engine.context_builder as context_builder
+    from persistence import session
+
+    messages = _messages_with_old_blocks()
+    session.ensure_project()
+    session.save_last_session(messages)
+    monkeypatch.setattr(context_builder, "compute_and_store_dynamic_context_budget", lambda *_args, **_kwargs: _fake_pressure())
+    monkeypatch.setattr(context_builder, "build_stm_projection", lambda _messages, budget=10000, **_kwargs: _fake_stm_projection())
+    monkeypatch.setattr(
+        context_builder,
+        "_memory_push_for_turn",
+        lambda *_args, **_kwargs: {
+            "status": "error",
+            "diagnostic_only": True,
+            "content": "<long-term-memory>Memory Push failed.</long-term-memory>",
+            "metrics": {"reason_code": "deadline_exceeded"},
+        },
+    )
+
+    context = context_builder.build_event_stream_context(
+        messages,
+        runtime_state={"_memory_push_enabled": True},
+    )
+
+    assert all("Memory Push failed" not in message.get("content", "") for message in context["messages"])
+    assert context["memory_push"]["status"] == "error"
+    assert context["memory_push"]["injected"] is False
 
 
 def test_context_builder_emits_focus_shift_after_detector_finishes(isolated_workspace, monkeypatch):
@@ -223,7 +265,7 @@ def test_context_builder_injects_ltm_maintenance_pressure_notice_at_thresholds(i
     assert mild["messages"][1]["role"] == "system"
     assert "pressure: 0.50" in mild["messages"][1]["content"]
     assert mild["messages"][1]["content"].count(context_builder.maintenance_pressure.MILD_SLEEP_SIGNAL) == 1
-    assert "because many recent experiences and memories" in mild["messages"][1]["content"]
+    assert "safe pause point" in mild["messages"][1]["content"]
 
     monkeypatch.setattr(
         context_builder.maintenance_pressure,
@@ -240,7 +282,7 @@ def test_context_builder_injects_ltm_maintenance_pressure_notice_at_thresholds(i
     strong = context_builder.build_event_stream_context(messages)
     assert "pressure: 0.75" in strong["messages"][1]["content"]
     assert strong["messages"][1]["content"].count(context_builder.maintenance_pressure.STRONG_SLEEP_SIGNAL) == 3
-    assert "A LARGE BACKLOG" in strong["messages"][1]["content"]
+    assert "pressure is high" in strong["messages"][1]["content"]
 
     monkeypatch.setattr(
         context_builder.maintenance_pressure,
@@ -257,7 +299,7 @@ def test_context_builder_injects_ltm_maintenance_pressure_notice_at_thresholds(i
     urgent = context_builder.build_event_stream_context(messages)
     assert "pressure: 0.90" in urgent["messages"][1]["content"]
     assert urgent["messages"][1]["content"].count(context_builder.maintenance_pressure.URGENT_SLEEP_SIGNAL) == 10
-    assert "SIGNIFICANTLY INTERFERING WITH YOUR ABILITY TO USE MEMORY RELIABLY" in urgent["messages"][1]["content"]
+    assert "pressure is urgent" in urgent["messages"][1]["content"]
 
 
 def test_context_builder_does_not_inject_ltm_pressure_below_threshold(isolated_workspace, monkeypatch):
@@ -337,12 +379,12 @@ def test_post_answer_message_can_create_and_persist_new_wm_ingress(isolated_work
     ]
     initial = stm_projection.build_stm_projection(before_answer, budget=100000)
     budget = initial["selected_tokens"]
-    assert not stm_projection.build_stm_projection(before_answer, budget=budget)["omitted_blocks"]
+    assert not stm_projection.build_stm_projection(before_answer, budget=budget)["omitted_units"]
 
     after_answer = [*before_answer, _message("assistant", "final response " * 30)]
     post_answer = stm_projection.build_stm_projection(after_answer, budget=budget)
-    assert post_answer["omitted_blocks"]
-    assert post_answer["latest_block_tokens"] <= budget
+    assert post_answer["omitted_units"]
+    assert post_answer["latest_unit_tokens"] <= budget
 
     session.ensure_project()
     session.save_last_session(after_answer)
@@ -351,10 +393,10 @@ def test_post_answer_message_can_create_and_persist_new_wm_ingress(isolated_work
     staged = wm_ingress.stage_wm_ingress_from_messages(after_answer, runtime_state)
     committed = wm_ingress.commit_staged_wm_ingress_watermark(runtime_state)
 
-    assert staged["omitted_block_count"] == 1
-    assert staged["staged_watermark"] == 2
-    assert committed["persisted_watermark"] == 2
-    assert wm_ingress.wm_ingress_watermark_status({})["persisted_watermark"] == 2
+    assert staged["omitted_unit_count"] >= 1
+    assert staged["staged_watermark"] == 1
+    assert committed["persisted_watermark"] == 1
+    assert wm_ingress.wm_ingress_watermark_status({})["persisted_watermark"] == 1
 
 
 def test_context_builder_renders_raw_and_sum_timeline(isolated_workspace, monkeypatch):
@@ -398,7 +440,7 @@ def test_context_builder_keeps_latest_wm_suffix_under_budget(isolated_workspace,
 
     messages = [
         _message("system", "system prompt"),
-        _message("user", "old " * 70),
+        _message("user", "old " * 2000),
         _message("assistant", "middle " * 20),
         _message("user", "latest user"),
     ]
@@ -412,10 +454,12 @@ def test_context_builder_keeps_latest_wm_suffix_under_budget(isolated_workspace,
             "messages": [_message("system", "system prompt"), _message("user", "latest user")],
             "budget": 10000,
             "selected_tokens": 10,
-            "selected_blocks": [{"kind": "interaction", "messages": [_message("user", "latest user")], "start_index": 3, "end_index": 3, "message_count": 1, "token_count": 10}],
-            "omitted_blocks": [{"kind": "interaction", "start_index": 1, "end_index": 2, "message_count": 2, "token_count": 5000}],
-            "latest_block_tokens": 10,
-            "total_blocks": 2,
+            "selected_units": [{"kind": "user", "messages": [_message("user", "latest user")], "start_index": 3, "end_index": 3, "message_count": 1, "token_count": 10}],
+            "omitted_units": [{"kind": "orphan", "start_index": 1, "end_index": 2, "message_count": 2, "token_count": 5000}],
+            "latest_unit_tokens": 10,
+            "total_units": 2,
+            "wm_ingress_watermark": -1,
+            "watermark_locked_omitted_unit_count": 0,
         },
     )
 
@@ -427,14 +471,14 @@ def test_context_builder_keeps_latest_wm_suffix_under_budget(isolated_workspace,
     assert context["working_memory"]["skipped_count"] == 1
 
 
-def test_context_builder_rejects_single_wm_slot_over_budget(isolated_workspace, monkeypatch):
-    import pytest
+def test_context_builder_recovers_single_wm_slot_over_budget(isolated_workspace, monkeypatch):
     import memory_engine.context_builder as context_builder
+    import memory_engine.event_stream as event_stream
     from persistence import session
 
     messages = [
         _message("system", "system prompt"),
-        _message("user", "测试" * 12000),
+        _message("user", "测试" * 60000),
         _message("user", "latest user"),
     ]
     session.ensure_project()
@@ -447,15 +491,19 @@ def test_context_builder_rejects_single_wm_slot_over_budget(isolated_workspace, 
             "messages": [_message("system", "system prompt"), _message("user", "latest user")],
             "budget": 10000,
             "selected_tokens": 10,
-            "selected_blocks": [{"kind": "interaction", "messages": [_message("user", "latest user")], "start_index": 2, "end_index": 2, "message_count": 1, "token_count": 10}],
-            "omitted_blocks": [{"kind": "interaction", "start_index": 1, "end_index": 1, "message_count": 1, "token_count": 12000}],
-            "latest_block_tokens": 10,
-            "total_blocks": 2,
+            "selected_units": [{"kind": "user", "messages": [_message("user", "latest user")], "start_index": 2, "end_index": 2, "message_count": 1, "token_count": 10}],
+            "omitted_units": [{"kind": "user", "start_index": 1, "end_index": 1, "message_count": 1, "token_count": 60000}],
+            "latest_unit_tokens": 10,
+            "total_units": 2,
+            "wm_ingress_watermark": -1,
+            "watermark_locked_omitted_unit_count": 0,
         },
     )
 
-    with pytest.raises(RuntimeError, match="Context Builder WM slot exceeds budget"):
-        context_builder.build_event_stream_context(messages)
+    context = context_builder.build_event_stream_context(messages)
+
+    assert context["context_pressure"]["capacity"]["capacity_recovery_action"] in {"summarized", "bounded_ref"}
+    assert event_stream.load_slot(1)["active_event_id"] != event_stream.load_slot(1)["original_event_id"]
 
 
 def test_context_status_is_metadata_only(isolated_workspace, monkeypatch):
@@ -510,11 +558,11 @@ def test_context_status_uses_effective_watermark_without_mutating_runtime_or_bud
     state = memory_state.build_memory_engine_state(messages=messages, runtime_state=runtime_state)
 
     assert status["wm_ingress_watermark"] == 2
-    assert status["watermark_locked_omitted_block_count"] == 1
-    assert status["stm_selected_block_count"] == 2
+    assert status["watermark_locked_omitted_unit_count"] == 2
+    assert status["stm_selected_unit_count"] == 4
     assert state["wm_ingress"]["runtime_watermark"] == 2
     assert state["wm_ingress"]["effective_watermark"] == 2
-    assert state["stm"]["selected_block_count"] == 2
+    assert state["stm"]["selected_unit_count"] == 4
     assert runtime_state == before_runtime
     assert wm_ingress.wm_ingress_watermark_status(runtime_state) == before_watermark
     with sqlite3.connect(event_stream.event_stream_db_path()) as connection:

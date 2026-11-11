@@ -123,6 +123,47 @@ def test_wake_queue_deduplicates_feedback_per_session():
     assert queue.put(second) is True
 
 
+def test_wake_queue_reports_duplicate_lifecycle_states():
+    from runtime.wake import WakeQueue, wake_event
+
+    queue = WakeQueue()
+    event = wake_event("maintainer", "maintenance_task_resumed", {}, wake_id="wake-stable")
+    assert queue.put_status(event) == "queued"
+    assert queue.put_status(event) == "already_queued"
+    assert queue.get(0) is event
+    assert queue.put_status(event) == "already_in_flight"
+    queue.mark_delivered(event)
+    assert queue.put_status(event) == "already_delivered"
+
+
+def test_wake_scheduler_retries_same_event_after_transient_deferral():
+    from runtime.wake import WakeQueue, WakeScheduler, wake_event
+
+    queue = WakeQueue()
+    event = wake_event("maintainer", "maintenance_task_resumed", {}, wake_id="wake-retry")
+    attempts = []
+    diagnostics = []
+
+    def deliver(current):
+        attempts.append(current.wake_id)
+        if len(attempts) == 1:
+            current.last_delivery_status = "deferred"
+            current.last_delivery_reason = "Main Agent turn lock is occupied"
+            return False
+        return True
+
+    queue.put(event)
+    scheduler = WakeScheduler(queue, deliver, on_retry=lambda *args: diagnostics.append(args))
+    deadline = time.time() + 2
+    while queue.has_work() and time.time() < deadline:
+        time.sleep(0.01)
+    scheduler.stop()
+
+    assert attempts == ["wake-retry", "wake-retry"]
+    assert diagnostics[0][1:] == ("deferred", "Main Agent turn lock is occupied")
+    assert not queue.has_work()
+
+
 def test_retriever_wake_is_tool_result_like(monkeypatch):
     from memory_engine.ltm import memory_retrieval as retrieval
 

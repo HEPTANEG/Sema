@@ -1,10 +1,13 @@
 import hashlib
+import copy
 import json
 import sqlite3
 from pathlib import Path
 
 import memory_engine.event_stream as event_stream
 from .stm_projection import build_stm_projection
+from .capacity_planner import preview_stm_capacity
+from .dynamic_context_budget import compute_and_store_dynamic_context_budget
 from .wm.ingress import effective_wm_ingress_watermark
 
 
@@ -137,16 +140,32 @@ def inspect_artifact(artifact_id, max_chars=2000, runtime_state=None):
 
 
 def get_stm_evidence(messages=None, runtime_state=None, max_chars=DEFAULT_STM_EVIDENCE_CHARS):
-    budget = int(((runtime_state or {}).get("context_pressure") or {}).get("budgets", {}).get("stm") or 10000)
+    current_messages = messages or event_stream.load_messages()
+    if isinstance(runtime_state, dict):
+        try:
+            runtime_copy = copy.deepcopy(runtime_state)
+        except Exception:
+            runtime_copy = dict(runtime_state)
+    else:
+        runtime_copy = {}
+    pressure = compute_and_store_dynamic_context_budget(
+        current_messages,
+        runtime_copy,
+        emit_observer=False,
+        stabilize=False,
+        apply_stabilizer=False,
+    )
     watermark = effective_wm_ingress_watermark(runtime_state)
+    capacity = preview_stm_capacity(current_messages, pressure, watermark, runtime_copy, advance_seq=False)
+    budget = capacity["effective_budget"]
     projection = build_stm_projection(
-        messages or event_stream.load_messages(),
+        current_messages,
         budget=budget,
         wm_ingress_watermark=watermark,
     )
     text = json.dumps(
         {
-            "selected_block_count": len(projection.get("selected_blocks") or []),
+            "selected_unit_count": len(projection.get("selected_units") or []),
             "selected_tokens": projection.get("selected_tokens", 0),
             "messages": projection.get("messages", []),
         },
@@ -161,7 +180,7 @@ def get_stm_evidence(messages=None, runtime_state=None, max_chars=DEFAULT_STM_EV
             "max_chars": max_chars,
             "wm_ingress_watermark": watermark,
         },
-        "selected_block_count": len(projection.get("selected_blocks") or []),
+        "selected_unit_count": len(projection.get("selected_units") or []),
         "selected_tokens": projection.get("selected_tokens", 0),
         "content_preview": preview,
         "truncated": truncated,

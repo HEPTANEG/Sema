@@ -55,8 +55,9 @@ Event Stream = trunk + branch artifacts.
 
 RAW / SUM should be decided before injection.
 
-- In STM, recent RAW can remain RAW even if it is very large, because STM is a
-  short-term high-fidelity zone.
+- STM keeps recent RAW high fidelity only while each newest atomic unit remains
+  within the configured STM maximum. Main Agent tool output is guarded before
+  append when it would exceed that maximum.
 - After content leaves STM and enters WM, a trunk RAW that exceeds the current
   token threshold should be represented by SUM.
 - If exact detail is needed, Sema can dereference the branch artifact or raw
@@ -162,7 +163,9 @@ token_count
 created_at
 ```
 
-V1 writes only original message events. It does not perform RAW -> SUM.
+Original messages create RAW or REF events. WM may later create a SUM or
+bounded REF and update only `active_event_id`; `original_event_id` remains
+unchanged.
 
 ### Artifact
 
@@ -222,6 +225,8 @@ Read-only helpers:
 load_slot(slot_seq)
 load_event(event_id)
 load_artifact(artifact_id)
+store_artifact(content, artifact_type)
+create_ref_event(slot_seq, metadata)
 ```
 
 Purpose: support debugging, future STM/WM/LTM source tracing, and safe local
@@ -266,10 +271,11 @@ evidence_audit(runtime_state=None)
 format_memory_engine_snapshot(snapshot)
 ```
 
-The observer reports storage counts, STM/WM ranges, context budget metadata,
+The observer reports storage counts, STM/WM ranges, context capacity metadata,
 Focus Segment metadata, assignment health, removed-layer status, and
 runtime-only evidence audit rows. `context_build_preview()` reports section
-metadata and selected slot/block ranges, not provider message bodies.
+metadata and selected slot/unit ranges, not provider message bodies. Its
+Capacity Planner preview and current-turn pin derivation do not persist state.
 
 Observer API V1 is not a user-facing memory feature, not semantic evaluation,
 not trace replay, and not LTM retrieval. It is read-only and must not run Focus

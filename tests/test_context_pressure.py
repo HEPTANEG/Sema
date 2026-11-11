@@ -26,7 +26,7 @@ def test_context_budget_matches_sporadic_simple_qa_fixture(monkeypatch):
     assert "R" not in result["scores"]
     assert result["budgets"]["stm_min"] == 1000
     assert result["budgets"]["wm_min"] == 1000
-    assert result["budgets"]["stm"] == 2587
+    assert result["budgets"]["stm"] == 2388
     assert result["budgets"]["wm"] == 4968
 
 
@@ -153,7 +153,7 @@ def test_proposed_i_l_and_budget_aggregation_weights():
         + 0.40 * features["f_current_user_input"],
         4,
     )
-    expected_stm = 0.40 * expected_i + 0.20 * result["scores"]["S"] + 0.40 * expected_l
+    expected_stm = 0.35 * expected_i + 0.30 * result["scores"]["S"] + 0.35 * expected_l
     expected_wm = max(expected_i, result["scores"]["S"], expected_l)
 
     assert result["scores"]["I"] == expected_i
@@ -169,38 +169,44 @@ def test_empty_signals_use_proposed_one_k_minimum():
     assert result["budgets"]["wm"] == 1000
 
 
-def test_context_build_failure_forces_target_budget_to_max():
+def test_shared_budget_failure_contributes_to_state_pressure():
     result = context_budget.compute_dynamic_context_budget(
         {
-            "context_build_failure": 1.0,
-            "failure_target": "wm",
-            "failure_required_tokens": 12000,
-            "failure_failed_budget": 10000,
+            "recent_tool_count": 0,
+            "continuous_session_context_budget_failure_count": 1,
         }
     )
 
-    assert result["scores"]["P_context"] == 1.0
-    assert result["budgets"]["wm"] == context_budget.WM_MAX_TOKENS
-    assert result["budgets"]["stm"] < context_budget.STM_MAX_TOKENS
-    assert result["failure"]["budget_action"] == "force_wm_max"
+    expected = round(1 - math.exp(-0.5), 4)
+    assert result["features"]["f_failure"] == expected
+    assert result["scores"]["S"] == expected
+    assert result["budgets"]["wm"] < context_budget.WM_MAX_TOKENS
 
 
-def test_context_build_failure_details_parse_stm_and_wm_errors():
-    from runtime import model_runtime
+def test_capacity_floors_share_one_failure_increment(isolated_workspace):
+    import memory_engine.budget_stabilizer as budget_stabilizer
+    from memory_engine.capacity_planner import finalize_capacity_plan
+    from persistence import session
 
-    stm = model_runtime.context_build_failure_details(
-        RuntimeError("STM latest interaction block exceeds budget: latest_block_tokens=12000, budget=10000.")
-    )
-    wm = model_runtime.context_build_failure_details(
-        RuntimeError("Context Builder WM slot exceeds budget: slot_seq=1, tokens=60000, budget=10000.")
-    )
+    session.ensure_project()
+    session.save_last_session([{"role": "system", "content": "system"}])
+    budget_stabilizer.reset_budget_stabilizer_state()
+    pressure = {
+        "budget_source": "dynamic",
+        "signals": {"continuous_session_key": "session-a"},
+        "budgets": {"stm_min": 1000, "stm_max": 50000, "stm": 2000, "wm_min": 1000, "wm_max": 50000, "wm": 2000},
+        "failure": {"continuous_session_context_budget_failure_count": 0, "f_failure": 0.0},
+    }
 
-    assert stm["target"] == "stm"
-    assert stm["required_tokens"] == 12000
-    assert stm["needs_preflight_recovery"] is False
-    assert wm["target"] == "wm"
-    assert wm["required_tokens"] == 60000
-    assert wm["needs_preflight_recovery"] is True
+    first = finalize_capacity_plan(pressure, 3000, 4000, persist=True)
+    second = finalize_capacity_plan(pressure, 3000, 4000, persist=True)
+
+    assert first["capacity"]["stm_floor_applied"] is True
+    assert first["capacity"]["wm_floor_applied"] is True
+    assert first["failure"]["continuous_session_context_budget_failure_count"] == 1
+    assert second["capacity"]["context_budget_failed"] is False
+    assert second["failure"]["continuous_session_context_budget_failure_count"] == 1
+    assert second["stabilizer"]["context_build_seq"] == 2
 
 
 def test_budget_stabilizer_raises_immediately_and_decays_slowly(isolated_workspace):
@@ -214,12 +220,12 @@ def test_budget_stabilizer_raises_immediately_and_decays_slowly(isolated_workspa
     high = {
         "budget_source": "dynamic",
         "budgets": {"stm_min": 1000, "stm_max": 50000, "stm": 39000, "wm_min": 1000, "wm_max": 50000, "wm": 20000},
-        "failure": {"context_build_failure": 0.0, "target": ""},
+        "failure": {"continuous_session_context_budget_failure_count": 0},
     }
     low = {
         "budget_source": "dynamic",
         "budgets": {"stm_min": 1000, "stm_max": 50000, "stm": 20000, "wm_min": 1000, "wm_max": 50000, "wm": 10000},
-        "failure": {"context_build_failure": 0.0, "target": ""},
+        "failure": {"continuous_session_context_budget_failure_count": 0},
     }
 
     first = budget_stabilizer.apply_budget_stabilizer(high, persist=True)
@@ -231,7 +237,7 @@ def test_budget_stabilizer_raises_immediately_and_decays_slowly(isolated_workspa
     assert second["stabilizer"]["context_build_seq"] == 2
 
 
-def test_budget_stabilizer_holds_high_watermark_and_failure_max(isolated_workspace):
+def test_budget_stabilizer_holds_high_watermark(isolated_workspace):
     import memory_engine.budget_stabilizer as budget_stabilizer
     from persistence import session
 
@@ -242,27 +248,18 @@ def test_budget_stabilizer_holds_high_watermark_and_failure_max(isolated_workspa
     high = {
         "budget_source": "dynamic",
         "budgets": {"stm_min": 1000, "stm_max": 50000, "stm": 45000, "wm_min": 1000, "wm_max": 50000, "wm": 10000},
-        "failure": {"context_build_failure": 0.0, "target": ""},
+        "failure": {"continuous_session_context_budget_failure_count": 0},
     }
     low = {
         "budget_source": "dynamic",
         "budgets": {"stm_min": 1000, "stm_max": 50000, "stm": 12000, "wm_min": 1000, "wm_max": 50000, "wm": 10000},
-        "failure": {"context_build_failure": 0.0, "target": ""},
+        "failure": {"continuous_session_context_budget_failure_count": 0},
     }
-    failure = {
-        "budget_source": "dynamic",
-        "budgets": {"stm_min": 1000, "stm_max": 50000, "stm": 12000, "wm_min": 1000, "wm_max": 50000, "wm": 12000},
-        "failure": {"context_build_failure": 1.0, "target": "wm"},
-    }
-
     budget_stabilizer.apply_budget_stabilizer(high, persist=True)
     held = budget_stabilizer.apply_budget_stabilizer(low, persist=True)
-    forced = budget_stabilizer.apply_budget_stabilizer(failure, persist=True)
 
     assert held["budgets"]["stm"] == 45000
     assert held["stabilizer"]["stm_hold_until_seq"] >= 4
-    assert forced["budgets"]["wm"] == 50000
-    assert forced["stabilizer"]["wm_hold_until_seq"] >= 8
 
 
 def test_continuous_session_token_stats_walks_adjacent_gaps(isolated_workspace):

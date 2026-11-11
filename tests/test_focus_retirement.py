@@ -30,7 +30,7 @@ def _patch_wm_preview(monkeypatch, selected_slots=(), wm_slots=(1, 2, 3, 4)):
             "ok": True,
             "working_memory": {"selected_slot_seqs": list(selected_slots)},
             "short_term_memory": {
-                "omitted_blocks": [
+                "omitted_units": [
                     {"start_index": slot, "end_index": slot} for slot in wm_slots
                 ]
             },

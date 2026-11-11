@@ -3,12 +3,16 @@ import threading
 
 from integrations.image_context import analyze_images_for_context, expire_image_context, list_images_for_context
 from runtime.context import messages_for_model
+from memory_engine.capacity_planner import CapacityLimitError
+from memory_engine.context_builder import context_status
 from memory_engine.state import build_memory_engine_state, format_memory_engine_state
+from memory_engine.tool_ingress import guard_tool_result
 from model.provider import build_chat_payload, call_chat_completion, call_chat_completion_stream, load_model_config, model_label, parse_chat_completion_message
 from shared import agent_formatting
 from runtime import background_tasks
 from runtime import model_runtime
 from runtime import structured_loop
+from runtime.maintenance_sleep import MaintenanceControlRequested
 from tools.background_commands import list_background_commands, read_background_command_output, start_background_command, stop_background_command
 from persistence.observability import summarize_args, summarize_tool_result
 from persistence.trajectory import complete_span, complete_trajectory, fail_span, fail_trajectory, record_event, start_span, start_trajectory
@@ -36,7 +40,7 @@ from memory_engine.ltm.formation_backfill import run_formation_backfill
 from memory_engine.ltm.memory_retrieval import run_retrieve_memory
 from memory_engine.ltm import retrieval_observation
 from memory_engine.ltm.memorize import run_memorize
-from memory_engine.wm import run_preflight_working_memory_recovery, run_working_memory_maintenance
+from memory_engine.wm import run_working_memory_maintenance
 from memory_engine.wm import commit_staged_wm_ingress_watermark, stage_wm_ingress_from_messages
 from runtime.directives import messages_with_runtime_directives, trace_runtime_directives
 from tools.tool_runtime import run_tool_request
@@ -141,7 +145,49 @@ def build_model_tools_payload(messages, runtime_state=None):
 
 def tool_schemas_for_model(runtime_state=None):
     from runtime.setup_capabilities import ltm_enabled, LTM_TOOLS
-    return TOOL_SCHEMAS if ltm_enabled() else [schema for schema in TOOL_SCHEMAS if schema.get("function", {}).get("name") not in LTM_TOOLS]
+    schemas = TOOL_SCHEMAS if ltm_enabled() else [schema for schema in TOOL_SCHEMAS if schema.get("function", {}).get("name") not in LTM_TOOLS]
+    if not ltm_enabled():
+        return schemas
+    from runtime.maintenance_sleep import (
+        AUTHORIZATION_TRACE_KEY,
+        continuation,
+        prepare_request_decision,
+        pressure_trace_fields,
+        request_decision,
+    )
+    from tools.tool_registry import get_tool_definition
+    active = continuation(runtime_state)
+    if active and active.get("status") in {"failed", "handed_off"}:
+        allowed = {"retry_ltm_maintenance", "return_maintenance_failure"}
+        return [get_tool_definition(name).schema() for name in sorted(allowed)]
+    decision = request_decision(runtime_state) or prepare_request_decision(runtime_state)
+    mode = decision.get("mode")
+    if isinstance(runtime_state, dict) and decision.get("latched_now"):
+        trace_event(
+            runtime_state,
+            "maintenance.gate_latched",
+            status="ok",
+            request_index=decision.get("request_index"),
+            **pressure_trace_fields(decision.get("snapshot")),
+        )
+        decision["latched_now"] = False
+    if isinstance(runtime_state, dict) and mode in {"soft", "mandatory"}:
+        request_index = int(decision.get("request_index") or 0)
+        if runtime_state.get(AUTHORIZATION_TRACE_KEY) != request_index:
+            trace_event(
+                runtime_state,
+                "maintenance.sleep_authorized",
+                status="ok",
+                mode=mode,
+                request_index=request_index,
+                **pressure_trace_fields(decision.get("snapshot")),
+            )
+            runtime_state[AUTHORIZATION_TRACE_KEY] = request_index
+    if mode == "mandatory":
+        return [get_tool_definition("sleep_for_maintenance").schema()]
+    if mode == "soft":
+        return [*schemas, get_tool_definition("sleep_for_maintenance").schema()]
+    return schemas
 
 
 def call_model_with_tools(messages, runtime_state=None):
@@ -183,80 +229,14 @@ def recoverable_model_error_message(error):
     return model_runtime.recoverable_model_error_message(error)
 
 
-def attempt_preflight_working_memory_recovery(error, messages, runtime_state=None):
-    if not model_runtime.is_context_build_error(error):
-        return {"triggered": False, "updated": False, "reason": "not_context_build_error", "error": None}
-    ui_event(runtime_state, "working_memory_preflight_started", path="preflight", error=str(error))
-    trace_event(runtime_state, "working_memory_preflight", status="started", path="preflight", error=str(error))
-    result = run_preflight_working_memory_recovery(messages, error, runtime_state=runtime_state)
-    status = "error" if result.get("error") else "ok"
-    ui_event(
-        runtime_state,
-        "working_memory_preflight_finished",
-        path="preflight",
-        status=status,
-        triggered=result.get("triggered", False),
-        updated=result.get("updated", False),
-        reason=result.get("reason", ""),
-        processed_count=result.get("processed_count", 0),
-        summarized_count=result.get("summarized_count", 0),
-        kept_raw_count=result.get("kept_raw_count", 0),
-        error=result.get("error") or "",
-    )
-    trace_event(
-        runtime_state,
-        "working_memory_preflight",
-        status=status,
-        path="preflight",
-        triggered=result.get("triggered", False),
-        updated=result.get("updated", False),
-        reason=result.get("reason", ""),
-        processed_count=result.get("processed_count", 0),
-        summarized_count=result.get("summarized_count", 0),
-        kept_raw_count=result.get("kept_raw_count", 0),
-        error=result.get("error") or "",
-    )
-    return result
-
-
 def outbound_context_error_message(messages, runtime_state=None):
-    state = runtime_state if isinstance(runtime_state, dict) else None
-    previous_phase = state.get("_context_build_phase") if state is not None else None
-    if state is not None:
-        state["_context_build_phase"] = "preflight"
     try:
-        try:
-            messages_for_model(messages, runtime_state=runtime_state)
-        except RuntimeError as error:
-            if not model_runtime.is_context_build_error(error):
-                raise
-            failure = model_runtime.apply_context_build_failure_pressure(error, runtime_state)
-            result = {"reason": "budget_saturation", "triggered": False}
-            if failure.get("needs_preflight_recovery"):
-                result = attempt_preflight_working_memory_recovery(error, messages, runtime_state)
-            try:
-                messages_for_model(messages, runtime_state=runtime_state)
-            except RuntimeError as retry_error:
-                message = model_runtime.context_build_error_message(retry_error)
-                trace_event(
-                    runtime_state,
-                    "context_build",
-                    status="error",
-                    path="preflight",
-                    recovery_reason=result.get("reason", ""),
-                    error=str(retry_error),
-                )
-                ui_event(runtime_state, "model_error", path="preflight", error=str(retry_error))
-                return message
-            finally:
-                model_runtime.clear_context_build_failure_pressure(runtime_state)
-        return ""
-    finally:
-        if state is not None:
-            if previous_phase is None:
-                state.pop("_context_build_phase", None)
-            else:
-                state["_context_build_phase"] = previous_phase
+        context_status(messages, runtime_state=runtime_state)
+    except CapacityLimitError as error:
+        trace_event(runtime_state, "context_build", status="error", path="capacity_preview", error=str(error))
+        ui_event(runtime_state, "model_error", path="capacity_preview", error=str(error))
+        return model_runtime.context_build_error_message(error)
+    return ""
 
 
 def call_model_with_structured_retries(messages, runtime_state=None):
@@ -468,6 +448,12 @@ def answer_with_tools(messages, permissions=None, runtime_state=None):
     try:
         answer_with_structured_tools(messages, permissions, runtime_state)
         complete_trajectory((runtime_state or {}).get("trajectory_context"), metadata={"path": "structured"})
+    except MaintenanceControlRequested as control:
+        complete_trajectory(
+            (runtime_state or {}).get("trajectory_context"),
+            metadata={"path": "structured", "suspended": True, "maintenance_action": control.action.get("action")},
+        )
+        raise
     except ToolRunStopped as error:
 
         fail_trajectory((runtime_state or {}).get("trajectory_context"), error, metadata={"path": "structured", "cancelled": True})
@@ -479,6 +465,8 @@ def answer_with_tools(messages, permissions=None, runtime_state=None):
         raise
     finally:
         if isinstance(runtime_state, dict):
+            from runtime.maintenance_sleep import clear_request_decision
+            clear_request_decision(runtime_state)
             runtime_state.pop("_memory_push_enabled", None)
             runtime_state.pop("_main_agent_context_timing_enabled", None)
 

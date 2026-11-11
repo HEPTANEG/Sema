@@ -9,6 +9,10 @@ General rules:
   input, not proof that a slot can be skipped.
 - submit_maintenance_plan takes the plan directly; never wrap it in another
   field. create_object is an atomic operation, not an intent type.
+- Submit independent modification groups as separate plans instead of placing
+  every change from a stage into one large plan. Keep objects, links, and
+  intents that must remain atomic together; do not split a dependency merely
+  to make a plan smaller.
 - retrieve_memory is a more powerful semantic memory-retrieval tool. Use
   get_object for known IDs, titles, or straightforward lookups. Use
   retrieve_memory when locating relevant memories requires semantic discovery
@@ -27,13 +31,39 @@ General rules:
   this retrieval attempt is incomplete, not that no relevant memory exists.
   Calling Retriever is optional; use direct observation when it is sufficient.
 - Do not invent aliases or unsupported tool parameters.
+- MemoryObject titles are short index labels, not full descriptions. Keep every
+  title within 1-50 Runtime-counted tokens and put detailed facts, conditions,
+  and explanations in the payload.
+- Payload size is measured as UTF-8 bytes of the body plus canonical JSON for
+  structured_data. At or below 2048 bytes, summary must be null. Above 2048
+  and at or below 8192 bytes, summary is required. Above 8192 bytes, split the
+  information into multiple focused objects. Runtime reports the measured
+  size when validation fails; do not guess that a summary can make an
+  oversized payload valid.
+- For an Episode, `payload.structured_data` must be `null`, `{}`, or an object
+  containing only `time_scope`. A non-empty `time_scope` needs at least one of
+  `start`, `end`, or `anchor`; `precision`, when present, is `exact`,
+  `approximate`, or `relative`. Runtime may expose a constrained repair for a
+  rejected title or Episode structured-data field; repair only the marked field.
+- For `abstract`, choose `tagged_with` only to create a Tag and apply it
+  directly to source objects of any type. Choose `supports` only to create an
+  assertion from existing source assertions or episodes; Tag objects cannot
+  support assertions. To create an Episode from Event Stream evidence, use an
+  atomic `create_object` with `object_type: episode` and an atomic
+  `create_link` with `relation_type: sourced_from` targeting its slot range.
+- For links created through `create_link` or `relink`, follow the endpoint
+  contract: `sourced_from` is MemoryObject -> Event Stream slot; `tagged_with`
+  is MemoryObject -> tag; `supports` and `contradicts` are assertion or episode
+  -> assertion; `supersedes` is MemoryObject -> MemoryObject. Runtime checks
+  existing object IDs and same-plan temp IDs before commit.
 
 Stage reports:
 Call complete_maintenance_stage exactly once, alone, after doing the current
 stage's work. The stage report must contain useful semantic memory content,
 topics, concrete clues, and necessary IDs or slot references, not a diary of
-tool calls. The stage_summary MUST NOT exceed the runtime-provided limit of
-500 tokens. This is a hard Runtime contract. If necessary, write less. If no
+tool calls. The stage_summary MUST NOT exceed the runtime-provided target of
+500 tokens. This is the normal output contract; do not rely on Runtime
+recovery tolerance. If necessary, write less. If no
 applicable work exists, use status no_applicable_work, but
 only after relevant inspection and still provide a concise summary. Do not
 call finish_maintenance from a semantic stage.

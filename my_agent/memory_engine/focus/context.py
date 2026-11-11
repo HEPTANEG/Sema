@@ -24,18 +24,25 @@ from .store import (
 def _eligible_wm_slots(messages, runtime_state=None):
     if not messages:
         return []
-    pressure = compute_and_store_dynamic_context_budget(messages, runtime_state, emit_observer=False, stabilize=False)
-    budgets = pressure.get("budgets") or {}
-    stm_budget = int(budgets.get("stm") or 10000)
+    pressure = compute_and_store_dynamic_context_budget(
+        messages,
+        runtime_state,
+        emit_observer=False,
+        stabilize=False,
+        apply_stabilizer=False,
+    )
+    budget_state = dict(runtime_state or {})
+    budget_state["context_pressure"] = pressure
+    stm_budget = wm_ingress.current_stm_budget(messages, budget_state)
     projection = build_stm_projection(
         messages,
         budget=stm_budget,
         wm_ingress_watermark=wm_ingress.effective_wm_ingress_watermark(runtime_state),
     )
     slots = []
-    for block in projection.get("omitted_blocks") or []:
-        start = int(block.get("start_index", 0))
-        end = int(block.get("end_index", start))
+    for unit in projection.get("omitted_units") or []:
+        start = int(unit.get("start_index", 0))
+        end = int(unit.get("end_index", start))
         for slot_seq in range(start, end + 1):
             if slot_seq >= 0 and slot_seq < len(messages) and messages[slot_seq].get("role") != "system":
                 slots.append(slot_seq)
@@ -169,7 +176,7 @@ def _stm_evidence(messages=None, runtime_state=None, limit=2000):
         "available": bool(result.get("ok")),
         "stm_budget": (result.get("query") or {}).get("budget", 0),
         "selected_token_count": int(result.get("selected_tokens") or 0),
-        "selected_block_count": int(result.get("selected_block_count") or 0),
+        "selected_unit_count": int(result.get("selected_unit_count") or 0),
         "content_preview": result.get("content_preview", ""),
         "truncated": bool(result.get("truncated", False)),
         "errors": result.get("errors") or [],

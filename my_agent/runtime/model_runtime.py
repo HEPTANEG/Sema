@@ -1,15 +1,9 @@
 import time
 import uuid
-import re
 
-from memory_engine.context_budget_override import effective_budget_ranges
-from memory_engine.dynamic_context_budget import STM_MAX_TOKENS, STM_MIN_TOKENS, WM_MAX_TOKENS, WM_MIN_TOKENS
+from memory_engine.capacity_planner import CapacityLimitError
 from persistence.trajectory import complete_span, fail_span, provider_exchange_observer, start_span
 from runtime.dependency_validation import validate_dependencies
-
-
-STM_CONTEXT_BUILD_ERROR_MARKER = "STM latest interaction block exceeds budget"
-CONTEXT_BUILDER_ERROR_MARKER = "Context Builder WM slot exceeds budget"
 
 
 MODEL_PAYLOAD_REQUIRED_DEPENDENCIES = (
@@ -37,6 +31,13 @@ MODEL_RETRY_REQUIRED_DEPENDENCIES = (
 )
 
 
+def _begin_maintenance_sleep_request(runtime_state):
+    if not isinstance(runtime_state, dict):
+        return
+    from runtime.maintenance_sleep import clear_request_decision
+    clear_request_decision(runtime_state)
+
+
 def model_timeout_message(dependencies):
     validate_dependencies(dependencies, ("MODEL_TIMEOUT_SECONDS", "model_label"), "model_runtime.model_timeout_message")
     return (
@@ -53,9 +54,10 @@ def build_model_tools_payload(messages, runtime_state=None, dependency_source=No
     )
     if "tool_schemas_for_model" not in dependencies:
         validate_dependencies(dependencies, ("TOOL_SCHEMAS",), "model_runtime.build_model_tools_payload")
+    _begin_maintenance_sleep_request(runtime_state)
     retrieval_plan = None
     dependencies["trace_retrieval_plan"](runtime_state, retrieval_plan)
-    outbound_messages = _messages_for_model_with_preflight_recovery(messages, retrieval_plan, runtime_state, dependencies)
+    outbound_messages = _messages_for_model(messages, retrieval_plan, runtime_state, dependencies)
     tools = dependencies.get("tool_schemas_for_model", lambda _runtime_state=None: dependencies["TOOL_SCHEMAS"])(runtime_state)
     return dependencies["build_chat_payload"](outbound_messages, tools=tools)
 
@@ -68,13 +70,14 @@ def call_model_with_tools(messages, runtime_state=None, dependency_source=None):
     )
     if "tool_schemas_for_model" not in dependencies:
         validate_dependencies(dependencies, ("TOOL_SCHEMAS",), "model_runtime.call_model_with_tools")
+    _begin_maintenance_sleep_request(runtime_state)
     streaming_enabled = (runtime_state or {}).get("streaming_enabled")
     message_id = (runtime_state or {}).get("assistant_message_id") or f"assistant-{uuid.uuid4().hex}"
     if runtime_state is not None and message_id:
         runtime_state["assistant_message_id"] = message_id
     retrieval_plan = None
     dependencies["trace_retrieval_plan"](runtime_state, retrieval_plan)
-    outbound_messages = _messages_for_model_with_preflight_recovery(messages, retrieval_plan, runtime_state, dependencies)
+    outbound_messages = _messages_for_model(messages, retrieval_plan, runtime_state, dependencies)
     preparation_parent = (runtime_state or {}).get("trajectory_context")
     preparation_span = _start_preparation_span(preparation_parent, runtime_state)
     try:
@@ -220,7 +223,7 @@ def parse_model_tool_message(data, dependency_source=None):
     return dependencies["parse_chat_completion_message"](data)
 
 
-def _messages_for_model_with_preflight_recovery(messages, retrieval_plan, runtime_state, dependencies):
+def _messages_for_model(messages, retrieval_plan, runtime_state, dependencies):
     model_messages = _run_preparation_stage(
         runtime_state,
         "system_prompt_refresh",
@@ -239,23 +242,7 @@ def _messages_for_model_with_preflight_recovery(messages, retrieval_plan, runtim
             runtime_state=runtime_state,
         )
 
-    try:
-        return build_once()
-    except RuntimeError as error:
-        if not is_context_build_error(error):
-            raise
-        failure = apply_context_build_failure_pressure(error, runtime_state)
-        try:
-            if not failure.get("needs_preflight_recovery"):
-                return build_once()
-            if not dependencies.get("attempt_preflight_working_memory_recovery"):
-                raise
-            result = dependencies["attempt_preflight_working_memory_recovery"](error, messages, runtime_state)
-            if not result.get("triggered"):
-                raise
-            return build_once()
-        finally:
-            clear_context_build_failure_pressure(runtime_state)
+    return build_once()
 
 
 def _messages_with_current_system_prompt(messages, dependencies):
@@ -320,8 +307,6 @@ def is_recoverable_model_error(error, dependency_source=None):
         ("RECOVERABLE_MODEL_ERROR_MARKERS",),
         "model_runtime.is_recoverable_model_error",
     )
-    if is_context_build_error(error):
-        return True
     error_text = str(error)
     return any(marker in error_text for marker in dependencies["RECOVERABLE_MODEL_ERROR_MARKERS"])
 
@@ -339,91 +324,20 @@ def is_context_limit_model_error(error, dependency_source=None):
 
 
 def is_context_build_error(error):
-    error_text = str(error)
-    return (
-        STM_CONTEXT_BUILD_ERROR_MARKER in error_text
-        or CONTEXT_BUILDER_ERROR_MARKER in error_text
-    )
-
-
-def context_build_failure_details(error):
-    error_text = str(error)
-    if STM_CONTEXT_BUILD_ERROR_MARKER in error_text:
-        match = re.search(r"latest_block_tokens=(\d+), budget=(\d+)", error_text)
-        if not match:
-            return {}
-        required_tokens = int(match.group(1))
-        failed_budget = int(match.group(2))
-        max_budget = _effective_max_budget("stm")
-        return {
-            "target": "stm",
-            "required_tokens": required_tokens,
-            "failed_budget": failed_budget,
-            "max_budget": max_budget,
-            "needs_preflight_recovery": required_tokens > max_budget,
-        }
-    if CONTEXT_BUILDER_ERROR_MARKER in error_text:
-        match = re.search(r"tokens=(\d+), budget=(\d+)", error_text)
-        if not match:
-            return {}
-        required_tokens = int(match.group(1))
-        failed_budget = int(match.group(2))
-        max_budget = _effective_max_budget("wm")
-        return {
-            "target": "wm",
-            "required_tokens": required_tokens,
-            "failed_budget": failed_budget,
-            "max_budget": max_budget,
-            "needs_preflight_recovery": required_tokens > max_budget,
-        }
-    return {}
-
-
-def _effective_max_budget(target):
-    try:
-        ranges = effective_budget_ranges(
-            {
-                "stm_min": STM_MIN_TOKENS,
-                "stm_max": STM_MAX_TOKENS,
-                "wm_min": WM_MIN_TOKENS,
-                "wm_max": WM_MAX_TOKENS,
-            }
-        )
-    except Exception:
-        ranges = {"stm_max": STM_MAX_TOKENS, "wm_max": WM_MAX_TOKENS}
-    return int(ranges.get(f"{target}_max") or (STM_MAX_TOKENS if target == "stm" else WM_MAX_TOKENS))
-
-
-def apply_context_build_failure_pressure(error, runtime_state=None):
-    details = context_build_failure_details(error)
-    if runtime_state is not None and details:
-        runtime_state["context_build_failure"] = {
-            "target": details["target"],
-            "required_tokens": details["required_tokens"],
-            "failed_budget": details["failed_budget"],
-            "max_budget": details["max_budget"],
-        }
-    return details
-
-
-def clear_context_build_failure_pressure(runtime_state=None):
-    if runtime_state is not None:
-        runtime_state.pop("context_build_failure", None)
+    return isinstance(error, CapacityLimitError)
 
 
 def context_build_error_message(error):
-    if CONTEXT_BUILDER_ERROR_MARKER in str(error):
+    if isinstance(error, CapacityLimitError) and error.target == "wm":
         return (
             f"Context build failed: {error}\n\n"
-            "Sema did not send this overlarge working-memory slot to the model. "
-            "Context Builder V1 keeps complete WM slots only; it does not truncate slots. "
-            "Continue with a shorter message, or let Working Memory summarize the oversized older slot."
+            "Sema did not send the context to the model. The newest Working Memory record still exceeds "
+            "the configured WM maximum after one exact-slot recovery attempt."
         )
     return (
         f"Context build failed: {error}\n\n"
-        "Sema did not send this overlarge interaction block to the model. "
-        "STM V1 keeps complete interaction blocks only; it does not truncate messages or split a block. "
-        "Send a shorter input, or continue with a new shorter message so the oversized block can be omitted from the next provider context."
+        "Sema did not send this input to the model because the newest atomic STM unit exceeds the configured "
+        "STM maximum. Shorten the current input or reduce the tool output at its source."
     )
 
 

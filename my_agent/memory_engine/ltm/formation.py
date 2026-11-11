@@ -5,6 +5,7 @@ selects durable evidence batches, asks one Formation Agent for a write
 decision, and lets the runtime add IDs and provenance before committing.
 """
 
+import copy
 import json
 import re
 import sqlite3
@@ -223,9 +224,10 @@ def _buffer_slots(messages, runtime_state=None, root=None, historical_slot_range
         runtime_state,
         emit_observer=False,
         stabilize=False,
+        apply_stabilizer=False,
     )
     budgets = pressure.get("budgets") or {}
-    stm_budget = int(budgets.get("stm") or 10000)
+    stm_budget = wm_ingress.current_stm_budget(messages, runtime_state)
     wm_budget = int(budgets.get("wm") or 6000)
     watermark = wm_ingress.effective_wm_ingress_watermark(runtime_state)
     projection = build_stm_projection(messages, budget=stm_budget, wm_ingress_watermark=watermark)
@@ -655,8 +657,56 @@ def _validation_repair_message(errors, plan):
         + "\nFor missing_summary, add a concise summary when the payload is over 2 KiB; "
         "for unexpected_summary, set summary to null when the payload is at or below 2 KiB; "
         "for payload_too_large, split the information into multiple focused objects; "
-        "for title_length, rewrite the title to 1-50 tokens without losing the fact."
+        "for title_length, rewrite the title to 1-50 tokens without losing the fact; "
+        "for Episode structured_data errors, use null or an empty object, or an object "
+        "whose only field is time_scope with at least one of start, end, or anchor and "
+        "an optional precision of exact, approximate, or relative."
     )
+
+
+def _formation_repair_fields(errors):
+    fields = {}
+    episode_codes = set(ltm_store.EPISODE_STRUCTURED_DATA_ERROR_CODES)
+    for error in errors or []:
+        if not isinstance(error, dict):
+            continue
+        match = re.fullmatch(r"objects\[(\d+)\]\.payload\.structured_data(?:\..*)?", str(error.get("path") or ""))
+        if match and error.get("code") in episode_codes:
+            fields.setdefault(int(match[1]), set()).add("structured_data")
+        match = re.fullmatch(r"objects\[(\d+)\]\.title", str(error.get("path") or ""))
+        if match and error.get("code") == "title_length":
+            fields.setdefault(int(match[1]), set()).add("title")
+    return fields
+
+
+def _formation_repair_scope_error(original, repaired, allowed_fields):
+    if not isinstance(repaired, dict) or repaired.get("action") != "write_plan":
+        return "Repair must return the same write_plan action."
+    original_objects = original.get("objects") if isinstance(original, dict) else None
+    repaired_objects = repaired.get("objects")
+    if not isinstance(original_objects, list) or not isinstance(repaired_objects, list) or len(original_objects) != len(repaired_objects):
+        return "Repair must preserve the number and order of objects."
+    if original.get("links") != repaired.get("links"):
+        return "Repair must not change links."
+    for index, (before, after) in enumerate(zip(original_objects, repaired_objects)):
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return f"Repair must preserve object {index}."
+        before_copy = copy.deepcopy(before)
+        after_copy = copy.deepcopy(after)
+        fields = allowed_fields.get(index, set())
+        if "title" in fields:
+            before_copy.pop("title", None)
+            after_copy.pop("title", None)
+        if "structured_data" in fields:
+            before_payload = before_copy.get("payload")
+            after_payload = after_copy.get("payload")
+            if isinstance(before_payload, dict):
+                before_payload.pop("structured_data", None)
+            if isinstance(after_payload, dict):
+                after_payload.pop("structured_data", None)
+        if before_copy != after_copy:
+            return f"Repair changed an unmarked field in objects[{index}]."
+    return None
 
 
 def _formation_decision(item, records, system_root_tags, runtime_state=None, max_tool_calls=None, root=None, work_span=None):
@@ -674,6 +724,8 @@ def _formation_decision(item, records, system_root_tags, runtime_state=None, max
     progress = FormationRetrievalProgress(tool_call_limit)
     normal_rounds = 0
     repairing = False
+    repair_base_result = None
+    repair_allowed_fields = {}
     try:
         while repairing or normal_rounds < tool_call_limit + 2:
             if repairing:
@@ -755,6 +807,14 @@ def _formation_decision(item, records, system_root_tags, runtime_state=None, max
                         }
                     )
                     continue
+                if repairing and repair_base_result is not None and repair_allowed_fields:
+                    scope_error = _formation_repair_scope_error(repair_base_result, result, repair_allowed_fields)
+                    if scope_error is not None:
+                        if metrics["validation_repair_count"] >= FORMATION_MAX_PLAN_REPAIRS:
+                            raise RuntimeError(scope_error)
+                        prompt.append(_assistant_history_message(message))
+                        prompt.append({"role": "user", "content": scope_error + " Only change the marked Episode structured_data or title fields."})
+                        continue
                 try:
                     candidate_plan = _normalized_write_plan(item, result, system_root_tags)
                     validation = _write_plan_validation(candidate_plan, root=root)
@@ -768,7 +828,7 @@ def _formation_decision(item, records, system_root_tags, runtime_state=None, max
                         "unexpected_summary",
                         "payload_too_large",
                         "title_length",
-                    }
+                    } | set(ltm_store.EPISODE_STRUCTURED_DATA_ERROR_CODES)
                     validation_errors = validation.get("errors") or []
                     _record_validation_errors(metrics, validation_errors)
                     if validation_errors and all(error.get("code") in repairable for error in validation_errors):
@@ -783,6 +843,9 @@ def _formation_decision(item, records, system_root_tags, runtime_state=None, max
                                 + json.dumps(validation_errors, ensure_ascii=False)
                             )
                         repairing = True
+                        if any(error.get("code") in ltm_store.EPISODE_STRUCTURED_DATA_ERROR_CODES for error in validation_errors):
+                            repair_base_result = copy.deepcopy(result)
+                            repair_allowed_fields = _formation_repair_fields(validation_errors)
                         prompt.append(_assistant_history_message(message))
                         prompt.append(
                             {

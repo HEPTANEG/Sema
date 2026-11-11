@@ -476,7 +476,14 @@ export async function cancelTurn(client: BridgeClient) {
 export async function applyConfigUpdates(client: BridgeClient, updates: Record<string, unknown>) {
   try {
     setBusy('saving config', true);
-    $config.set((await client.updateConfig(updates)) as Record<string, unknown>);
+    const result = await client.updateConfig(updates) as Record<string, unknown>;
+    $config.set(result);
+    const modelConfig = result.config;
+    if (modelConfig && typeof modelConfig === 'object') {
+      const provider = String((modelConfig as Record<string, unknown>).provider || '');
+      const model = String((modelConfig as Record<string, unknown>).model || '');
+      if (provider && model) $model.set(`${provider}:${model}`);
+    }
     finishActivity('ready');
     return true;
   } catch (error) {

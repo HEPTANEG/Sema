@@ -10,7 +10,9 @@ Retrieval-specific behavior remains in the formal
 
 The current slice provides a process-local `WakeQueue`, stable `wake_id`
 de-duplication, one-feedback-per-Retrieval-Session backpressure, and a daemon
-`WakeScheduler` that retries delivery when the Main Agent turn lock is busy.
+`WakeScheduler` that retries delivery when Main Agent is temporarily unable to
+accept a Wake. Deferrals and delivery failures retain the same queued event and
+are reported with an attempt number and reason.
 Memorize completion is also delivered through this same path in
 Wake-enabled Runtime entries.
 Delivered Retrieval payloads use a provider-valid `role=user` projection while
@@ -70,9 +72,57 @@ normal Event Stream persistence path. Formation remains eligible to interpret
 these slots through its ordinary evidence-bound process. No special filter is
 added, and Formation is not required to create a memory from the Wake.
 
-Only successful completion emits this Wake. Failed maintenance does not wake
-Main Agent. A missing optional summary may produce a minimal completion Wake,
-but no semantic content is invented.
+Manual maintenance emits this narration Wake only after successful completion.
+A missing optional summary may produce a minimal completion Wake, but no
+semantic content is invented. Maintainer records `maintenance.wake_queued`
+only after the Wake queue confirms that the stable `wake_id` is queued, already
+in flight, or already delivered. Queue rejection and callback errors are
+recorded as `maintenance.wake_failed`; they do not rerun the completed
+maintenance.
+
+### Main-Agent Task Resume Wake
+
+When Main Agent calls `sleep_for_maintenance`, Runtime suspends its current
+logical task at a model decision boundary and runs Maintainer. A successful run
+emits a distinct Wake:
+
+```text
+Maintainer completion
+  -> original wake_prompt + compact completion metadata
+  -> Wake(source="maintainer", kind="maintenance_task_resumed")
+  -> Main-Agent turn resumes the task
+```
+
+The sleep call is authorized by the pressure decision attached to the model
+request that produced it. Runtime does not revoke the call by recomputing
+pressure during tool execution. If pressure reached `1.0`, a process-local
+mandatory latch keeps the Main Agent at the sleep boundary until Bridge creates
+the running continuation. Bridge then releases the latch and the continuation
+governs maintenance completion, failure, and Wake delivery.
+
+The `wake_prompt` records the task goal, exact progress, and next step. Existing
+Main-Agent messages and STM/WM are retained; the prompt provides an explicit
+continuation pointer. The resume Wake includes completion status and summary
+cache identifiers, but not the full maintenance summary. This keeps the Wake
+within the STM atomic-unit maximum while the retained conversation
+provides the task context. This continuation is process-local and is not
+recovered after Runtime restart. The resume Wake uses the existing Event Stream
+delivery behavior and does not use the manual-maintenance dream narration.
+
+When the `maintenance_task_resumed` Wake is accepted, the TUI closes the
+terminal Maintainer view and returns to the Main-Agent conversation while the
+continuation turn runs. Manual `maintenance_completed` narration Wakes close the
+same view.
+
+On failure, Runtime sends
+`Wake(source="maintainer", kind="maintenance_sleep_failed")` with the failure
+reason, attempt count, original prompt, and maintenance run ID. Main Agent can
+only retry the same run or return the failure to the user. Returning the failure
+stops automatic retries but preserves the task as paused; a hard pressure gate
+continues to prevent ordinary task work.
+
+When this failure Wake is delivered, the TUI closes the terminal Maintainer
+view and returns to the Main-Agent conversation while it handles the failure.
 
 The payload remains owned by the producing Agent. Wake only delivers it and
 starts a Main-Agent turn; it does not decide whether the producing task is
@@ -113,8 +163,9 @@ Wake scheduling coordinates background work with Main Agent turns:
 - Main Agent turns are serialized; Runtime never runs two Main-Agent turns at
   the same time.
 - Main Agent execution and LTM Maintainer execution are mutually exclusive.
-  User messages received while the Maintainer is active are rejected, not
-  queued.
+  User messages received while Maintainer is active are rejected. Messages
+  received before maintenance starts enter Main-Agent context; pressure is
+  enforced at the model decision boundary.
 - Retriever work may continue independently where its Session and Wake
   backpressure rules allow it.
 - A background producer does not wait for Main Agent acknowledgement after
@@ -131,14 +182,18 @@ private work steps do not.
 
 The Scheduler performs only these operations:
 
-1. Determine whether Main Agent is currently running.
+1. Determine whether Main Agent can accept the Wake now.
 2. Select the next deliverable Wake Event in production order.
 3. Start one new Main-Agent turn for that event, or combine it with a
    near-simultaneous user input according to the priority rule above.
 
 Main Agent turns remain serialized. A busy Main Agent is not interrupted by a
-Wake Event. An idle Main Agent may be proactively awakened without a new user
-message. Retriever work continues independently while events wait in the queue.
+Wake Event. Pending message responses, a running Maintainer, evaluation work,
+an arriving user message, a busy turn lock, or an unavailable Main-Agent phase
+defer delivery. The same Wake remains queued and is retried with bounded
+backoff; each deferral records the reason and attempt. An idle Main Agent may
+be proactively awakened without a new user message. Retriever work continues
+independently while events wait in the queue.
 Retrieval feedback applies one backpressure rule:
 there may be at most one undelivered feedback event for a Retrieval Session.
 When that slot is occupied, the Retriever pauses before producing another
@@ -151,17 +206,23 @@ Delivery is serialized with Event Stream writes:
 Wake Event ready
   -> Scheduler obtains Main-Agent turn lock
   -> append a provider-compatible raw slot with the producer source and Wake envelope
+  -> mark this wake_id persisted and emit wake_delivered
   -> build provider-compatible projection
   -> start Main-Agent structured loop
   -> mark Wake Event delivered
 ```
 
-`wake_id` makes retries idempotent: a Runtime retry must not append the same
-event or trigger the same Main-Agent activation twice. Closing a Retrieval
+`wake_id` makes retries idempotent. Before the Wake message is persisted, a
+delivery failure or temporary deferral retries the same queued event. Once the
+message is persisted, a failure before the Main-Agent loop starts retries from
+the in-memory message without appending another Event Stream slot. Once the
+recovery turn has started, the event is accepted; a later provider or turn error
+does not append the Wake again or start a second recovery turn.
+`wake_delivered` is emitted after Event Stream persistence. Closing a Retrieval
 Session removes its pending events. Wake itself does not force Main Agent to
 produce a particular response; the awakened Main Agent may report, continue
-Retrieval, provide guidance, close the Session, or handle the accompanying
-user input.
+Retrieval, provide guidance, close the Session, or handle the accompanying user
+input.
 
 ## Payload Projection
 

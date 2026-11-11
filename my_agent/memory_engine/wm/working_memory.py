@@ -1,5 +1,4 @@
 import json
-import re
 from datetime import datetime, timezone
 
 import memory_engine.event_stream as event_stream
@@ -7,7 +6,7 @@ from . import ingress as wm_ingress
 from model.provider import call_chat_completion
 from shared.prompt_loader import load_prompt
 from .. import evidence
-from ..stm_projection import build_interaction_blocks, stm_projection_status
+from ..stm_projection import stm_projection_status
 from ..token_counter import count_text_tokens
 
 
@@ -23,7 +22,6 @@ WORKING_MEMORY_TIMEOUT_SECONDS = 45
 WORKING_MEMORY_AGENT = "working-memory-maintainer-v1"
 SUM_TRIGGER_TOKENS = 400
 SUM_MAX_RETRIES = 1
-PREFLIGHT_MAX_CANDIDATES = 3
 
 
 
@@ -171,9 +169,9 @@ def _omitted_slot_sequences(messages, runtime_state=None):
         wm_ingress_watermark=wm_ingress.effective_wm_ingress_watermark(runtime_state),
     )
     sequences = []
-    for block in status.get("omitted_blocks", []):
-        start = int(block.get("start_index", 0))
-        end = int(block.get("end_index", start))
+    for unit in status.get("omitted_units", []):
+        start = int(unit.get("start_index", 0))
+        end = int(unit.get("end_index", start))
         sequences.extend(range(start, end + 1))
     return status, set(sequences)
 
@@ -225,42 +223,6 @@ def _preflight_candidate_slots_for_sequences(sequences, min_tokens=SUM_TRIGGER_T
             continue
         candidates.append(record)
     return candidates
-
-
-def _preflight_top_largest_candidates(sequences, limit=PREFLIGHT_MAX_CANDIDATES):
-    candidates = [
-        record
-        for record in _preflight_candidate_slots_for_sequences(sequences, min_tokens=0)
-        if record.get("source") != "system"
-    ]
-    candidates.sort(key=lambda record: int(record.get("active_token_count") or 0), reverse=True)
-    selected = candidates[: int(limit)]
-    return sorted(selected, key=lambda record: int(record["slot_seq"]))
-
-
-def _reprocessed_slot_seqs(candidates):
-    return [
-        int(record["slot_seq"])
-        for record in candidates or []
-        if record.get("wm_status") == "kept_raw"
-    ]
-
-
-def _latest_block_sequences(messages):
-    blocks = build_interaction_blocks(messages or event_stream.load_messages())
-    if not blocks:
-        return [], {}
-    block = blocks[-1]
-    start = int(block.get("start_index", 0))
-    end = int(block.get("end_index", start))
-    return list(range(start, end + 1)), block
-
-
-def _wm_error_slot_sequence(error_text):
-    match = re.search(r"slot_seq=(\d+)", str(error_text or ""))
-    if not match:
-        return None
-    return int(match.group(1))
 
 
 def _message_content_text(message):
@@ -511,8 +473,8 @@ def _processed_counts(processed):
 def _write_last_result(connection, result):
     _state_set(connection, "last_result", json.dumps(result, ensure_ascii=False, sort_keys=True))
     _state_set(connection, "last_run_at", _now())
-    if "omitted_block_count" in result:
-        _state_set(connection, "last_omitted_block_count", result["omitted_block_count"])
+    if "omitted_unit_count" in result:
+        _state_set(connection, "last_omitted_unit_count", result["omitted_unit_count"])
     connection.commit()
 
 
@@ -654,16 +616,16 @@ def run_working_memory_maintenance(messages=None, force=False, runtime_state=Non
     messages = messages or event_stream.load_messages()
     try:
         stm, candidates = _candidate_slots(messages, runtime_state)
-        omitted_count = int(stm.get("omitted_block_count", 0))
+        omitted_count = int(stm.get("omitted_unit_count", 0))
         with event_stream.ensure_event_stream() as connection:
             _ensure_tables(connection)
-            previous_omitted = int(_state_get(connection, "last_omitted_block_count", "0") or 0)
+            previous_omitted = int(_state_get(connection, "last_omitted_unit_count", "0") or 0)
             if not force and omitted_count <= previous_omitted and not candidates:
                 result = {
                     "triggered": False,
                     "updated": False,
-                    "reason": "no_new_omitted_block",
-                    "omitted_block_count": omitted_count,
+                    "reason": "no_new_omitted_unit",
+                    "omitted_unit_count": omitted_count,
                     "candidate_count": len(candidates),
                     "error": None,
                 }
@@ -674,8 +636,8 @@ def run_working_memory_maintenance(messages=None, force=False, runtime_state=Non
                 result = {
                     "triggered": False,
                     "updated": False,
-                    "reason": "no_omitted_blocks",
-                    "omitted_block_count": omitted_count,
+                    "reason": "no_omitted_units",
+                    "omitted_unit_count": omitted_count,
                     "candidate_count": 0,
                     "error": None,
                 }
@@ -687,7 +649,7 @@ def run_working_memory_maintenance(messages=None, force=False, runtime_state=Non
                     "triggered": True,
                     "updated": False,
                     "reason": "no_candidates",
-                    "omitted_block_count": omitted_count,
+                    "omitted_unit_count": omitted_count,
                     "candidate_count": 0,
                     "error": None,
                 }
@@ -714,7 +676,7 @@ def run_working_memory_maintenance(messages=None, force=False, runtime_state=Non
                 "action": last.get("action", ""),
                 "slot_seq": last.get("slot_seq", ""),
                 "sum_event_id": last.get("sum_event_id", ""),
-                "omitted_block_count": omitted_count,
+                "omitted_unit_count": omitted_count,
                 "candidate_count": len(candidates),
                 "processed_count": len(processed),
                 "updated_count": updated_count,
@@ -740,114 +702,44 @@ def run_working_memory_maintenance(messages=None, force=False, runtime_state=Non
         return result
 
 
-
-def run_preflight_working_memory_recovery(messages=None, error=None, runtime_state=None):
-    messages = messages or event_stream.load_messages()
-    error_text = str(error or "")
+def compact_exact_slot(slot_seq, runtime_state=None):
+    slot_seq = int(slot_seq)
+    candidates = _preflight_candidate_slots_for_sequences([slot_seq], min_tokens=0)
     try:
-        candidate_policy = "none"
-        fallback_candidate_count = 0
-        preflight_target = ""
-        if "STM latest interaction block exceeds budget" in error_text:
-            sequences, block = _latest_block_sequences(messages)
-            candidates = _preflight_candidate_slots_for_sequences(sequences)
-            candidate_policy = "preflight_threshold_or_kept_raw"
-            if not candidates:
-                candidates = _preflight_top_largest_candidates(sequences)
-                candidate_policy = "preflight_top_n_largest"
-                fallback_candidate_count = len(candidates)
-            trigger_reason = "latest_stm_block_oversized"
-            preflight_target = "stm_latest_block"
-            trigger_metadata = {
-                "latest_block_start": int(block.get("start_index", 0)) if block else "",
-                "latest_block_end": int(block.get("end_index", 0)) if block else "",
-                "latest_block_tokens": int(block.get("token_count", 0)) if block else 0,
-            }
-        elif "Context Builder WM slot exceeds budget" in error_text:
-            slot_seq = _wm_error_slot_sequence(error_text)
-            candidates = _preflight_candidate_slots_for_sequences([slot_seq], min_tokens=0) if slot_seq is not None else []
-            candidate_policy = "preflight_exact_slot"
-            preflight_target = "wm_slot"
-            trigger_reason = "wm_slot_oversized"
-            trigger_metadata = {
-                "slot_seq": slot_seq if slot_seq is not None else "",
-            }
-        else:
-            candidates = []
-            trigger_reason = "not_context_build_error"
-            trigger_metadata = {}
-
-        if not candidates:
-            result = {
-                "triggered": trigger_reason != "not_context_build_error",
-                "updated": False,
-                "reason": "no_candidates" if trigger_reason != "not_context_build_error" else trigger_reason,
-                "preflight": True,
-                "candidate_count": 0,
-                "processed_count": 0,
-                "updated_count": 0,
-                "summarized_count": 0,
-                "kept_raw_count": 0,
-                "candidate_policy": candidate_policy,
-                "preflight_target": preflight_target,
-                "reprocessed_slot_seqs": _reprocessed_slot_seqs(candidates),
-                "fallback_candidate_count": fallback_candidate_count,
-                "error": None,
-                **trigger_metadata,
-            }
-            with event_stream.ensure_event_stream() as connection:
-                _ensure_tables(connection)
-                _write_last_result(connection, result)
-            return result
-
-        processed = []
-        for slot in sorted(candidates, key=lambda record: int(record["slot_seq"])):
-            processed.append(_process_candidate(slot, runtime_state=runtime_state))
-
-        counts = _processed_counts(processed)
-        last = processed[-1] if processed else {}
-        result = {
-            "triggered": True,
-            "updated": counts["updated_count"] > 0,
-            "reason": "preflight_recovery",
-            "decision_reason": last.get("decision_reason", ""),
-            "action": last.get("action", ""),
-            "slot_seq": last.get("slot_seq", ""),
-            "sum_event_id": last.get("sum_event_id", ""),
-            "preflight": True,
-            "candidate_count": len(candidates),
-            "processed_count": len(processed),
-            "updated_count": counts["updated_count"],
-            "summarized_count": counts["summarized_count"],
-            "kept_raw_count": counts["kept_raw_count"],
-            "processed_slot_seqs": [item.get("slot_seq") for item in processed],
-            "candidate_policy": candidate_policy,
-            "preflight_target": preflight_target,
-            "reprocessed_slot_seqs": _reprocessed_slot_seqs(candidates),
-            "fallback_candidate_count": fallback_candidate_count,
-            "error": None,
-            **trigger_metadata,
+        processed = _process_candidate(candidates[0], runtime_state=runtime_state) if candidates else None
+    except Exception:
+        processed = None
+    if processed and processed.get("updated"):
+        return {
+            "updated": True,
+            "action": "summarized",
+            "slot_seq": slot_seq,
+            "sum_event_id": processed.get("sum_event_id", ""),
         }
-        with event_stream.ensure_event_stream() as connection:
-            _ensure_tables(connection)
-            _write_last_result(connection, result)
-        return result
-    except Exception as error:
-        result = {
-            "triggered": False,
-            "updated": False,
-            "reason": "preflight_error",
-            "preflight": True,
-            "candidate_policy": "none",
-            "preflight_target": "",
-            "reprocessed_slot_seqs": [],
-            "fallback_candidate_count": 0,
-            "error": str(error),
-        }
-        with event_stream.ensure_event_stream() as connection:
-            _ensure_tables(connection)
-            _write_last_result(connection, result)
-        return result
+    slot = event_stream.load_slot(slot_seq)
+    original = event_stream.load_message(slot_seq)
+    content = original.get("content", "") if isinstance(original, dict) else ""
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False)
+    preview = content[:2000]
+    metadata = {
+        "status": "too_large",
+        "source_slot_seq": slot_seq,
+        "source_role": original.get("role", slot.get("source", "")) if isinstance(original, dict) else slot.get("source", ""),
+        "original_event_id": slot.get("original_event_id", ""),
+        "original_token_count": int(event_stream.load_event(slot["original_event_id"]).get("token_count") or 0),
+        "preview": preview,
+        "truncated": len(content) > len(preview),
+        "retrieval_guidance": "Inspect the immutable original event through Event Stream evidence or a narrower source operation.",
+        "created_by": WORKING_MEMORY_AGENT,
+    }
+    ref = event_stream.create_ref_event(slot_seq, metadata)
+    return {
+        "updated": True,
+        "action": "bounded_ref",
+        "slot_seq": slot_seq,
+        "ref_event_id": ref.get("event_id", ""),
+    }
 
 
 
@@ -873,10 +765,6 @@ def format_working_memory_status(status):
         f"last_decision_reason: {last.get('decision_reason', '')}",
         f"last_action: {last.get('action', '')}",
         f"last_slot_seq: {last.get('slot_seq', '')}",
-        f"last_candidate_policy: {last.get('candidate_policy', '')}",
-        f"last_preflight_target: {last.get('preflight_target', '')}",
-        f"last_reprocessed_slot_seqs: {json.dumps(last.get('reprocessed_slot_seqs', []), ensure_ascii=False)}",
-        f"last_fallback_candidate_count: {last.get('fallback_candidate_count', 0)}",
         "current_candidates:",
     ]
     for candidate in status.get("current_candidates", [])[:12]:
@@ -928,7 +816,7 @@ def format_working_memory_run(result):
         f"updated_count: {result.get('updated_count', 0)}",
         f"summarized_count: {result.get('summarized_count', 0)}",
         f"kept_raw_count: {result.get('kept_raw_count', 0)}",
-        f"omitted_block_count: {result.get('omitted_block_count', 0)}",
+        f"omitted_unit_count: {result.get('omitted_unit_count', 0)}",
         f"candidate_policy: {result.get('candidate_policy', '')}",
         f"preflight_target: {result.get('preflight_target', '')}",
         f"reprocessed_slot_seqs: {json.dumps(result.get('reprocessed_slot_seqs', []), ensure_ascii=False)}",

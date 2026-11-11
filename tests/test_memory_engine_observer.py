@@ -21,11 +21,11 @@ def _fake_pressure(stm=10000, wm=6000):
         "budget_source": "dynamic+stabilized",
         "scores": {"I": 0.1, "S": 0.2, "R": 0.0, "L": 0.3, "P_context": 0.3},
         "budgets": {
-            "stm_min": 10000,
+            "stm_min": 1000,
             "stm_max": 50000,
             "stm": stm,
             "stm_raw": stm,
-            "wm_min": 10000,
+            "wm_min": 1000,
             "wm_max": 50000,
             "wm": wm,
             "wm_raw": wm,
@@ -44,23 +44,32 @@ def _fake_stm_projection():
         ],
         "budget": 10000,
         "selected_tokens": 12,
-        "selected_blocks": [
+        "selected_units": [
             {
-                "kind": "interaction",
-                "messages": [_message("user", "latest user body"), _message("assistant", "latest assistant body")],
+                "kind": "user",
+                "messages": [_message("user", "latest user body")],
                 "start_index": 3,
+                "end_index": 3,
+                "message_count": 1,
+                "token_count": 6,
+            },
+            {
+                "kind": "assistant",
+                "messages": [_message("assistant", "latest assistant body")],
+                "start_index": 4,
                 "end_index": 4,
-                "message_count": 2,
-                "token_count": 12,
-            }
+                "message_count": 1,
+                "token_count": 6,
+            },
         ],
-        "omitted_blocks": [
-            {"kind": "interaction", "start_index": 1, "end_index": 2, "message_count": 2, "token_count": 20}
+        "omitted_units": [
+            {"kind": "user", "start_index": 1, "end_index": 1, "message_count": 1, "token_count": 10},
+            {"kind": "assistant", "start_index": 2, "end_index": 2, "message_count": 1, "token_count": 10},
         ],
-        "latest_block_tokens": 12,
-        "total_blocks": 2,
+        "latest_unit_tokens": 6,
+        "total_units": 4,
         "wm_ingress_watermark": -1,
-        "watermark_locked_omitted_block_count": 0,
+        "watermark_locked_omitted_unit_count": 0,
     }
 
 
@@ -141,8 +150,9 @@ def test_context_build_preview_reports_ranges_without_mutating_context_state(iso
     assert preview["ok"] is True
     assert preview["context_order"] == ["system", "working_memory", "long_term_memory", "short_term_memory"]
     assert preview["working_memory"]["selected_slot_seqs"] == [1, 2]
-    assert preview["short_term_memory"]["selected_blocks"] == [
-        {"kind": "interaction", "start_index": 3, "end_index": 4, "message_count": 2, "token_count": 12}
+    assert preview["short_term_memory"]["selected_units"] == [
+        {"kind": "user", "start_index": 3, "end_index": 3, "message_count": 1, "token_count": 6},
+        {"kind": "assistant", "start_index": 4, "end_index": 4, "message_count": 1, "token_count": 6},
     ]
     assert "staged_wm_ingress_watermark_slot_seq" not in runtime_state
     with sqlite3.connect(event_stream.event_stream_db_path()) as connection:
@@ -192,7 +202,7 @@ def test_stm_evidence_excludes_watermark_locked_blocks_without_mutating_ingress(
     payload = json.loads(result["content_preview"])
 
     assert result["query"]["wm_ingress_watermark"] == 2
-    assert result["selected_block_count"] == 1
+    assert result["selected_unit_count"] == 2
     assert "old user body" not in json.dumps(payload, ensure_ascii=False)
     assert "old assistant body" not in json.dumps(payload, ensure_ascii=False)
     assert "latest user body" in json.dumps(payload, ensure_ascii=False)
@@ -219,7 +229,7 @@ def test_stm_evidence_without_watermark_keeps_eligible_blocks(isolated_workspace
     rendered = json.dumps(payload, ensure_ascii=False)
 
     assert result["query"]["wm_ingress_watermark"] == -1
-    assert result["selected_block_count"] == 2
+    assert result["selected_unit_count"] == 4
     assert "old user body" in rendered
     assert "latest assistant body" in rendered
 
@@ -264,9 +274,9 @@ def test_stm_consumers_share_effective_watermark_boundary(isolated_workspace):
     rendered = json.dumps(payload, ensure_ascii=False)
 
     assert stm_result["query"]["wm_ingress_watermark"] == 6
-    assert stm_result["selected_block_count"] == 1
+    assert stm_result["selected_unit_count"] == 2
     assert preview["short_term_memory"]["wm_ingress_watermark"] == 6
-    assert preview["short_term_memory"]["watermark_locked_omitted_block_count"] == 3
+    assert preview["short_term_memory"]["watermark_locked_omitted_unit_count"] == 6
     assert snapshot["context_preview"]["short_term_memory"]["wm_ingress_watermark"] == 6
     assert snapshot["wm_ingress"]["persisted_watermark"] == 2
     assert snapshot["wm_ingress"]["runtime_watermark"] == 4

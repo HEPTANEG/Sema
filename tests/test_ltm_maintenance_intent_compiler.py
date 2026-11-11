@@ -56,6 +56,14 @@ def test_submit_maintenance_plan_schema_is_strict_and_atomic_create_only():
     abstract_variants = [variant for variant in intent_variants if variant["properties"]["intent_type"]["enum"] == ["abstract"]]
     assert {variant["properties"]["relation_type"]["enum"][0] for variant in abstract_variants} == {"tagged_with", "supports"}
     assert {variant["properties"]["new_object"]["properties"]["object_type"]["enum"][0] for variant in abstract_variants} == {"tag", "assertion"}
+    link_schema = next(variant for variant in atomic_variants if variant["properties"]["operation_type"]["enum"] == ["create_link"])["properties"]["link"]
+    assert "supports" in link_schema["properties"]["relation_type"]["description"]
+    assert "assertion target" in link_schema["properties"]["relation_type"]["description"]
+    new_object = atomic_variants[0]["properties"]["new_object"]
+    episode_branch = next(branch for branch in new_object["oneOf"] if branch["properties"]["object_type"]["enum"] == ["episode"])
+    structured_schema = episode_branch["properties"]["payload"]["properties"]["structured_data"]
+    assert structured_schema["oneOf"][0]["type"] == "null"
+    assert "time_scope" in structured_schema["oneOf"][1]["properties"]
 
 
 def test_abstract_tagged_with_creates_direct_tag_links(isolated_workspace):
@@ -165,4 +173,54 @@ def test_maintenance_plan_vector_failure_leaves_no_partial_update(isolated_works
     monkeypatch.setattr(ltm_store, "_stage_vector_objects", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
     result = ltm_store.commit_maintenance_plan(compiled, compiled["idempotency_key"], isolated_workspace)
     assert result["status"] == "rejected"
+    assert ltm_store.get_object(_id("a"), root=isolated_workspace)["title"] == "Old"
+
+
+def test_maintenance_plan_reports_internal_commit_phases(isolated_workspace):
+    _seed(isolated_workspace)
+    compiled = maintenance_intent_compiler.compile_maintenance_action_plan(
+        {"intents": [{"intent_type": "update_title", "object_id": _id("a"), "new_title": "Updated"}]},
+        "run-phases",
+        0,
+        isolated_workspace,
+    )
+    phases = []
+    result = ltm_store.commit_maintenance_plan(
+        compiled,
+        compiled["idempotency_key"],
+        isolated_workspace,
+        phase_callback=lambda phase, status, detail: phases.append((phase, status, detail)),
+    )
+
+    assert result["status"] == "committed"
+    assert phases == [
+        ("ensure_ltm_store", "started", {}),
+        ("ensure_ltm_store", "completed", {}),
+        ("stage_vector_embedding", "started", {"object_count": 1}),
+        ("stage_vector_embedding", "completed", {"object_count": 1}),
+        ("sqlite_commit", "started", {}),
+        ("sqlite_commit", "completed", {}),
+    ]
+
+
+def test_maintenance_plan_embedding_timeout_is_structured(isolated_workspace, monkeypatch):
+    from memory_engine.ltm.embedding_adapter import EmbeddingServiceTimeout
+
+    _seed(isolated_workspace)
+    compiled = maintenance_intent_compiler.compile_maintenance_action_plan(
+        {"intents": [{"intent_type": "update_title", "object_id": _id("a"), "new_title": "Timed out"}]},
+        "run-timeout",
+        0,
+        isolated_workspace,
+    )
+    monkeypatch.setattr(
+        ltm_store,
+        "_stage_vector_objects",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(EmbeddingServiceTimeout("embedding stalled")),
+    )
+
+    result = ltm_store.commit_maintenance_plan(compiled, compiled["idempotency_key"], isolated_workspace)
+
+    assert result["status"] == "rejected"
+    assert result["errors"][0]["code"] == "vector_sync_timeout"
     assert ltm_store.get_object(_id("a"), root=isolated_workspace)["title"] == "Old"

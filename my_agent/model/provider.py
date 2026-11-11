@@ -57,21 +57,42 @@ class _PooledConnectionLease:
 
 
 class _PooledResponse:
-    def __init__(self, lease, response):
+    def __init__(self, lease, response, timeout=None):
         self._lease = lease
         self._response = response
         self._fully_consumed = False
         self._closed = False
+        self._deadline = None if timeout is None else time.monotonic() + float(timeout)
+
+    def _check_deadline(self):
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            raise TimeoutError("Provider response exceeded its total timeout.")
 
     def read(self, amount=-1):
-        data = self._response.read(amount)
-        if amount is None or amount < 0 or not data:
-            self._fully_consumed = True
-        return data
+        self._check_deadline()
+        if amount is not None and amount >= 0:
+            data = self._response.read(amount)
+            if not data:
+                self._fully_consumed = True
+            return data
+        chunks = []
+        while True:
+            self._check_deadline()
+            chunk = self._response.read(65536)
+            if not chunk:
+                self._fully_consumed = True
+                return b"".join(chunks)
+            chunks.append(chunk)
 
     def __iter__(self):
         try:
-            for line in self._response:
+            iterator = iter(self._response)
+            while True:
+                self._check_deadline()
+                try:
+                    line = next(iterator)
+                except StopIteration:
+                    break
                 yield line
             self._fully_consumed = True
         finally:
@@ -196,7 +217,7 @@ class _ProviderConnectionPool:
                 headers,
                 io.BytesIO(body),
             )
-        return _PooledResponse(lease, response)
+        return _PooledResponse(lease, response, timeout=timeout)
 
     def close_all(self):
         with self._lock:
@@ -354,7 +375,7 @@ def _configured_model_section():
 
 def load_model_config():
     configured = _configured_model_section()
-    provider_name = os.getenv("SEMA_PROVIDER") or configured.get("provider") or "deepseek"
+    provider_name = configured.get("provider") or os.getenv("SEMA_PROVIDER") or "deepseek"
     profile = PROVIDER_PROFILES.get(provider_name)
     if profile:
         config = dict(profile)
@@ -377,11 +398,16 @@ def load_model_config():
         config["protocol"] = (profile or {}).get("protocol", "openai_compatible")
 
 
-    if config["provider"] == "deepseek":
-        config["model"] = os.getenv("DEEPSEEK_MODEL", config["model"])
-    config["model"] = os.getenv("SEMA_MODEL", config["model"])
-    config["base_url"] = os.getenv("SEMA_BASE_URL", config["base_url"])
-    config["api_key_env"] = os.getenv("SEMA_API_KEY_ENV", config["api_key_env"])
+    if not configured.get("model"):
+        model_override = os.getenv("SEMA_MODEL")
+        if not model_override and config["provider"] == "deepseek":
+            model_override = os.getenv("DEEPSEEK_MODEL")
+        if model_override:
+            config["model"] = model_override
+    if not configured.get("base_url") and os.getenv("SEMA_BASE_URL"):
+        config["base_url"] = os.getenv("SEMA_BASE_URL")
+    if not configured.get("api_key_env") and os.getenv("SEMA_API_KEY_ENV"):
+        config["api_key_env"] = os.getenv("SEMA_API_KEY_ENV")
     return config
 
 
@@ -567,7 +593,7 @@ def normalize_temperature_for_provider(config, temperature):
     return temperature
 
 
-def build_chat_payload(messages, tools=None, temperature=None, stream=False):
+def build_chat_payload(messages, tools=None, temperature=None, stream=False, max_tokens=None):
     config = load_model_config()
     if not config.get("model"):
         raise RuntimeError("Model provider model is not configured.")
@@ -590,6 +616,8 @@ def build_chat_payload(messages, tools=None, temperature=None, stream=False):
             payload["options"] = {"temperature": temperature}
         else:
             payload["temperature"] = temperature
+    if max_tokens is not None:
+        payload["max_tokens"] = int(max_tokens)
     return payload
 
 
@@ -600,6 +628,7 @@ def call_chat_completion(
     timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
     purpose="model",
     *,
+    max_tokens=None,
     exchange_observer=None,
     exchange_metadata=None,
 ):
@@ -612,11 +641,12 @@ def call_chat_completion(
             temperature=temperature,
             timeout_seconds=timeout_seconds,
             purpose=purpose,
+            max_tokens=max_tokens,
             exchange_observer=exchange_observer,
             exchange_metadata=exchange_metadata,
         )
     api_key, key_source = api_key_for_config(config)
-    payload = build_chat_payload(messages, tools=tools, temperature=temperature)
+    payload = build_chat_payload(messages, tools=tools, temperature=temperature, max_tokens=max_tokens)
     request_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         _chat_completions_url(config.get("base_url")),
@@ -688,6 +718,7 @@ def call_chat_completion_stream(
     check_cancel=None,
     on_headers=None,
     *,
+    max_tokens=None,
     exchange_observer=None,
     exchange_metadata=None,
 ):
@@ -695,7 +726,7 @@ def call_chat_completion_stream(
     if config.get("protocol") == "ollama_native":
         raise RuntimeError("Ollama Native provider does not support streaming in V1.")
     api_key, key_source = api_key_for_config(config)
-    payload = build_chat_payload(messages, tools=tools, temperature=temperature, stream=True)
+    payload = build_chat_payload(messages, tools=tools, temperature=temperature, stream=True, max_tokens=max_tokens)
     request_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         _chat_completions_url(config.get("base_url")),
@@ -838,11 +869,12 @@ def _call_ollama_chat_completion(
     temperature=None,
     timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
     purpose="model",
+    max_tokens=None,
     exchange_observer=None,
     exchange_metadata=None,
 ):
     api_key, key_source = api_key_for_config(config)
-    payload = build_chat_payload(messages, tools=tools, temperature=temperature, stream=False)
+    payload = build_chat_payload(messages, tools=tools, temperature=temperature, stream=False, max_tokens=max_tokens)
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"

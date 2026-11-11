@@ -1,15 +1,7 @@
 from .token_counter import count_message_tokens
 
 
-
-
-
-
-
-
-
 STM_TOKEN_BUDGET = 10000
-
 
 
 def split_system_messages(messages):
@@ -29,7 +21,6 @@ def split_system_messages(messages):
     return system_messages, remaining
 
 
-
 def build_interaction_blocks(messages):
     _system_messages, remaining = split_system_messages(messages)
     blocks = []
@@ -37,81 +28,124 @@ def build_interaction_blocks(messages):
     for message in remaining:
         if message.get("role") == "user":
             if current:
-                blocks.append(_finalize_block(current))
+                blocks.append(_finalize_group(current))
             current = {"kind": "interaction", "messages": [message]}
             continue
-
         if current is None:
             current = {"kind": "orphan", "messages": [message]}
         else:
             current["messages"].append(message)
-
     if current:
-        blocks.append(_finalize_block(current))
+        blocks.append(_finalize_group(current))
     return blocks
 
+
+def build_projection_units(messages):
+    _system_messages, remaining = split_system_messages(messages)
+    units = []
+    index = 0
+    while index < len(remaining):
+        message = remaining[index]
+        role = message.get("role")
+        tool_calls = message.get("tool_calls") if role == "assistant" else None
+        if isinstance(tool_calls, list) and tool_calls:
+            call_ids = {
+                str(call.get("id") or "")
+                for call in tool_calls
+                if isinstance(call, dict) and str(call.get("id") or "")
+            }
+            bundled = [message]
+            cursor = index + 1
+            while cursor < len(remaining):
+                candidate = remaining[cursor]
+                if candidate.get("role") != "tool":
+                    break
+                tool_call_id = str(candidate.get("tool_call_id") or "")
+                if call_ids and tool_call_id not in call_ids:
+                    break
+                bundled.append(candidate)
+                cursor += 1
+            units.append(_finalize_group({"kind": "tool_bundle", "messages": bundled}))
+            index = cursor
+            continue
+        if role == "user":
+            kind = "user"
+        elif role == "assistant":
+            kind = "assistant"
+        elif role == "tool":
+            kind = "orphan_tool"
+        else:
+            kind = "orphan"
+        units.append(_finalize_group({"kind": kind, "messages": [message]}))
+        index += 1
+    return units
 
 
 def build_stm_projection(messages, budget=STM_TOKEN_BUDGET, wm_ingress_watermark=-1):
     system_messages, _remaining = split_system_messages(messages)
-    blocks = build_interaction_blocks(messages)
-    selected_blocks, omitted_blocks, selected_tokens, watermark_locked_count = _select_blocks(
-        blocks,
+    units = build_projection_units(messages)
+    selected_units, omitted_units, selected_tokens, watermark_locked_count = _select_units(
+        units,
         budget,
         wm_ingress_watermark=wm_ingress_watermark,
     )
     projected = [
         _strip_internal_fields(message)
-        for message in [*system_messages, *[message for block in selected_blocks for message in block["messages"]]]
+        for message in [*system_messages, *[message for unit in selected_units for message in unit["messages"]]]
     ]
     return {
         "messages": projected,
-        "budget": budget,
+        "budget": int(budget),
         "selected_tokens": selected_tokens,
-        "selected_blocks": selected_blocks,
-        "omitted_blocks": omitted_blocks,
+        "selected_units": selected_units,
+        "omitted_units": omitted_units,
         "wm_ingress_watermark": int(wm_ingress_watermark),
-        "watermark_locked_omitted_block_count": watermark_locked_count,
-        "latest_block_tokens": blocks[-1]["token_count"] if blocks else 0,
-        "total_blocks": len(blocks),
+        "watermark_locked_omitted_unit_count": watermark_locked_count,
+        "latest_unit_tokens": units[-1]["token_count"] if units else 0,
+        "total_units": len(units),
     }
-
 
 
 def stm_projection_status(messages, budget=STM_TOKEN_BUDGET, wm_ingress_watermark=-1):
     projection = build_stm_projection(messages, budget=budget, wm_ingress_watermark=wm_ingress_watermark)
-    selected_blocks = projection["selected_blocks"]
-    omitted_blocks = projection["omitted_blocks"]
-    all_blocks = [*omitted_blocks, *selected_blocks]
-    omitted_tokens = sum(int(block["token_count"]) for block in omitted_blocks)
-    total_block_tokens = omitted_tokens + int(projection["selected_tokens"])
-    largest_block_tokens = max([int(block["token_count"]) for block in all_blocks], default=0)
+    selected_units = projection["selected_units"]
+    omitted_units = projection["omitted_units"]
+    all_units = [*omitted_units, *selected_units]
+    omitted_tokens = sum(int(unit["token_count"]) for unit in omitted_units)
+    total_unit_tokens = omitted_tokens + int(projection["selected_tokens"])
+    largest_unit_tokens = max([int(unit["token_count"]) for unit in all_units], default=0)
     return {
         "budget": projection["budget"],
         "wm_ingress_watermark": projection["wm_ingress_watermark"],
-        "watermark_locked_omitted_block_count": projection["watermark_locked_omitted_block_count"],
+        "watermark_locked_omitted_unit_count": projection["watermark_locked_omitted_unit_count"],
         "selected_tokens": projection["selected_tokens"],
         "omitted_tokens": omitted_tokens,
-        "total_block_tokens": total_block_tokens,
+        "total_unit_tokens": total_unit_tokens,
         "budget_used_ratio": round(projection["selected_tokens"] / projection["budget"], 4) if projection["budget"] else 0,
-        "selected_block_count": len(selected_blocks),
-        "omitted_block_count": len(omitted_blocks),
-        "latest_block_tokens": projection["latest_block_tokens"],
-        "largest_block_tokens": largest_block_tokens,
-        "total_block_count": projection["total_blocks"],
+        "selected_unit_count": len(selected_units),
+        "omitted_unit_count": len(omitted_units),
+        "latest_unit_tokens": projection["latest_unit_tokens"],
+        "largest_unit_tokens": largest_unit_tokens,
+        "total_unit_count": projection["total_units"],
         "total_message_count": len(messages or []),
         "non_system_message_count": sum(1 for message in messages or [] if message.get("role") != "system"),
-        "selected_blocks": [_block_metadata(block) for block in selected_blocks],
-        "omitted_blocks": [_block_metadata(block) for block in omitted_blocks],
+        "selected_units": [_unit_metadata(unit) for unit in selected_units],
+        "omitted_units": [_unit_metadata(unit) for unit in omitted_units],
     }
 
 
-def _finalize_block(block):
-    messages = block["messages"]
+def latest_eligible_unit_tokens(messages, wm_ingress_watermark=-1):
+    watermark = int(wm_ingress_watermark if wm_ingress_watermark is not None else -1)
+    eligible = [unit for unit in build_projection_units(messages) if int(unit["start_index"]) > watermark]
+    return int(eligible[-1]["token_count"]) if eligible else 0
+
+
+def _finalize_group(group):
+    messages = group["messages"]
     token_count = sum(count_message_tokens(_strip_internal_fields(message)) for message in messages)
     indexes = [message["_message_index"] for message in messages]
     return {
-        "kind": block["kind"],
+        "kind": group["kind"],
         "messages": messages,
         "start_index": indexes[0],
         "end_index": indexes[-1],
@@ -120,40 +154,38 @@ def _finalize_block(block):
     }
 
 
-def _select_blocks(blocks, budget, wm_ingress_watermark=-1):
+def _select_units(units, budget, wm_ingress_watermark=-1):
     if budget < 1:
         raise RuntimeError("STM token budget must be positive.")
     watermark = int(wm_ingress_watermark if wm_ingress_watermark is not None else -1)
-    locked = [block for block in blocks if int(block["end_index"]) <= watermark]
-    eligible = [block for block in blocks if int(block["end_index"]) > watermark]
+    locked = [unit for unit in units if int(unit["start_index"]) <= watermark]
+    eligible = [unit for unit in units if int(unit["start_index"]) > watermark]
     if eligible and eligible[-1]["token_count"] > budget:
         raise RuntimeError(
-            f"STM latest interaction block exceeds budget: "
-            f"latest_block_tokens={eligible[-1]['token_count']}, budget={budget}. "
-            "STM V1 does not truncate messages or interaction blocks."
+            "STM newest atomic unit exceeds budget: "
+            f"latest_unit_tokens={eligible[-1]['token_count']}, budget={budget}."
         )
-
     selected = []
     selected_tokens = 0
-    for block in reversed(eligible):
-        next_tokens = selected_tokens + block["token_count"]
+    for unit in reversed(eligible):
+        next_tokens = selected_tokens + unit["token_count"]
         if next_tokens > budget:
             break
-        selected.append(block)
+        selected.append(unit)
         selected_tokens = next_tokens
     selected.reverse()
     omitted_count = len(eligible) - len(selected)
-    omitted = [_omit_block_messages(block) for block in [*locked, *eligible[:omitted_count]]]
+    omitted = [_omit_group_messages(unit) for unit in [*locked, *eligible[:omitted_count]]]
     return selected, omitted, selected_tokens, len(locked)
 
 
-def _block_metadata(block):
+def _unit_metadata(unit):
     return {
-        "kind": block["kind"],
-        "start_index": block["start_index"],
-        "end_index": block["end_index"],
-        "message_count": block["message_count"],
-        "token_count": block["token_count"],
+        "kind": unit["kind"],
+        "start_index": unit["start_index"],
+        "end_index": unit["end_index"],
+        "message_count": unit["message_count"],
+        "token_count": unit["token_count"],
     }
 
 
@@ -162,7 +194,8 @@ def _strip_internal_fields(message):
     copied.pop("_message_index", None)
     return copied
 
-def _omit_block_messages(block):
-    copied = dict(block)
+
+def _omit_group_messages(group):
+    copied = dict(group)
     copied.pop("messages", None)
     return copied

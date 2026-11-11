@@ -1,6 +1,7 @@
 import json
 import copy
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 
@@ -8,13 +9,16 @@ import memory_engine.event_stream as event_stream
 import memory_engine.focus as focus
 from memory_engine.ltm import maintenance_pressure, memory_push_cache, memory_push_ranking
 import memory_engine.wm.ingress as wm_ingress
+import memory_engine.wm.pins as wm_pins
 from agents.temporal_state import CONTINUOUS_SESSION_GAP_SECONDS, ensure_process_temporal_state
 from bridge.ui_events import emit_ui_event
 from persistence.trajectory import complete_span, fail_span, record_event, start_span
 from .ltm import ltm_store
-from .dynamic_context_budget import compute_and_store_dynamic_context_budget
+from .capacity_planner import CapacityLimitError, finalize_capacity_plan, preview_stm_capacity
+from .dynamic_context_budget import _emit_context_pressure_observer, compute_and_store_dynamic_context_budget
 from .stm_projection import STM_TOKEN_BUDGET, build_stm_projection
 from .token_counter import count_message_tokens, count_text_tokens
+from .wm import compact_exact_slot
 
 
 
@@ -24,6 +28,7 @@ from .token_counter import count_message_tokens, count_text_tokens
 
 
 WM_TOKEN_BUDGET = 6000
+MEMORY_PUSH_FOREGROUND_TIMEOUT_SECONDS = 60
 FULL_REFRESH_INTERVAL = 10
 TOOL_RESULT_LIKE_PROCESSING_CLASS = "tool_result_like"
 _FULL_REFRESH_LOCK = threading.RLock()
@@ -147,17 +152,49 @@ def _build_event_stream_context_impl(messages, runtime_state=None):
                         target_segment_id=focus_result.get("target_segment_id", ""),
                     )
     with _context_timing_stage(runtime_state, "context_pressure"):
-        pressure = compute_and_store_dynamic_context_budget(messages, runtime_state, emit_observer=True, stabilize=True)
-    budgets = pressure.get("budgets") or {}
-    stm_budget = int(budgets.get("stm") or STM_TOKEN_BUDGET)
-    wm_budget = int(budgets.get("wm") or WM_TOKEN_BUDGET)
+        pressure = compute_and_store_dynamic_context_budget(
+            messages,
+            runtime_state,
+            emit_observer=False,
+            stabilize=False,
+            apply_stabilizer=False,
+        )
     with _context_timing_stage(runtime_state, "stm_projection"):
         watermark = wm_ingress.effective_wm_ingress_watermark(runtime_state)
-        stm_projection = build_stm_projection(messages, budget=stm_budget, wm_ingress_watermark=watermark)
+        stm_capacity = preview_stm_capacity(messages, pressure, watermark, runtime_state, advance_seq=True)
+        stm_projection = build_stm_projection(
+            messages,
+            budget=stm_capacity["effective_budget"],
+            wm_ingress_watermark=watermark,
+        )
     with _context_timing_stage(runtime_state, "wm_ingress"):
-        wm_ingress.stage_wm_ingress_from_projection(runtime_state, stm_projection)
+        pin = wm_pins.pin_record(wm_pins.resolve_pin_for_projection(stm_projection, messages, persist=False))
     with _context_timing_stage(runtime_state, "wm_projection"):
-        wm_records = _build_working_memory_projection(stm_projection, budget=wm_budget)
+        pin, wm_requirement, recovery_action = _prepare_working_memory_capacity(
+            stm_projection,
+            pin,
+            pressure,
+            runtime_state=runtime_state,
+            persist=True,
+        )
+        pressure = finalize_capacity_plan(
+            pressure,
+            stm_capacity["required_tokens"],
+            wm_requirement["required_tokens"],
+            persist=True,
+        )
+        pressure["capacity"]["capacity_recovery_action"] = recovery_action
+        if isinstance(runtime_state, dict):
+            runtime_state["context_pressure"] = pressure
+            _emit_context_pressure_observer(runtime_state, pressure)
+        budgets = pressure.get("budgets") or {}
+        stm_budget = int(budgets.get("stm") or stm_capacity["effective_budget"])
+        wm_budget = int(budgets.get("wm") or WM_TOKEN_BUDGET)
+        if stm_budget != int(stm_projection.get("budget") or 0):
+            stm_projection = build_stm_projection(messages, budget=stm_budget, wm_ingress_watermark=watermark)
+        wm_ingress.stage_wm_ingress_from_projection(runtime_state, stm_projection)
+        pin = wm_pins.pin_record(wm_pins.resolve_pin_for_projection(stm_projection, messages, persist=True))
+        wm_records = _build_working_memory_projection(stm_projection, budget=wm_budget, pin=pin)
         wm_message = _build_working_memory_message(wm_records)
     with _context_timing_stage(runtime_state, "observe_window"):
         observe_window(messages, runtime_state)
@@ -179,17 +216,20 @@ def _build_event_stream_context_impl(messages, runtime_state=None):
     with _context_timing_stage(runtime_state, "ltm_result_processing"):
         outbound = []
         outbound.extend(_system_messages(stm_projection["messages"]))
-        maintenance_notice = maintenance_pressure.maintenance_pressure_context_notice() if ltm_enabled() else "LTM is unavailable. STM and Working Memory remain active. Do not claim to retrieve or save long-term memories. The user can configure local memory models in Settings > Model."
+        maintenance_notice = maintenance_pressure.maintenance_pressure_context_notice(runtime_state=runtime_state) if ltm_enabled() else "LTM is unavailable. STM and Working Memory remain active. Do not claim to retrieve or save long-term memories. The user can configure local memory models in Settings > Model."
         if maintenance_notice:
             outbound.append({"role": "system", "content": maintenance_notice})
         if wm_message:
             outbound.append(wm_message)
         if memory_push_result.get("content"):
             memory_push_result = memory_push_ranking.validate_push_result(memory_push_result)
-        if memory_push_result.get("content"):
+        if (
+            memory_push_result.get("content")
+            and memory_push_result.get("status") == "ok"
+            and not memory_push_result.get("diagnostic_only")
+        ):
             outbound.append({"role": "user", "content": memory_push_result["content"]})
-            if memory_push_result.get("status") == "ok":
-                _record_memory_push_successful_uses(memory_push_result, runtime_state)
+            _record_memory_push_successful_uses(memory_push_result, runtime_state)
     with _context_timing_stage(runtime_state, "context_assembly"):
         outbound.extend(_non_system_messages(stm_projection["messages"]))
     with _context_timing_stage(runtime_state, "context_token_count"):
@@ -214,12 +254,20 @@ def _build_event_stream_context_impl(messages, runtime_state=None):
 
 def context_status(messages, runtime_state=None):
     runtime_copy = _runtime_copy(runtime_state)
-    pressure = compute_and_store_dynamic_context_budget(messages, runtime_copy, emit_observer=False, stabilize=False)
+    pressure = compute_and_store_dynamic_context_budget(
+        messages,
+        runtime_copy,
+        emit_observer=False,
+        stabilize=False,
+        apply_stabilizer=False,
+    )
     context = _build_event_stream_context_with_pressure(messages, pressure, runtime_state=runtime_copy)
     wm = context["working_memory"]
     stm = context["short_term_memory"]
     scores = pressure.get("scores") or {}
     budgets = pressure.get("budgets") or {}
+    capacity = pressure.get("capacity") or {}
+    failure = pressure.get("failure") or {}
     return {
         "context_order": context["context_order"],
         "budget_source": pressure.get("budget_source") or "fixed",
@@ -244,14 +292,20 @@ def context_status(messages, runtime_state=None):
         "wm_resolved_title_count": wm.get("resolved_title_count", 0),
         "wm_resident_slot_count": wm.get("resident_slot_count", 0),
         "wm_resident_raw_token_count": wm.get("resident_raw_token_count", 0),
+        "wm_pin_source_slot_seq": wm.get("pin_source_slot_seq"),
+        "wm_pin_tokens": wm.get("pin_tokens", 0),
+        "wm_pin_deduplicated": bool(wm.get("pin_deduplicated")),
         "stm_budget": stm["budget"],
         "stm_raw_budget": budgets.get("stm_raw", budgets.get("stm", 0)),
         "wm_raw_budget": budgets.get("wm_raw", budgets.get("wm", 0)),
         "wm_ingress_watermark": stm.get("wm_ingress_watermark", -1),
-        "watermark_locked_omitted_block_count": stm.get("watermark_locked_omitted_block_count", 0),
+        "watermark_locked_omitted_unit_count": stm.get("watermark_locked_omitted_unit_count", 0),
         "stm_selected_tokens": stm["selected_tokens"],
-        "stm_selected_block_count": len(stm["selected_blocks"]),
-        "stm_omitted_block_count": len(stm["omitted_blocks"]),
+        "stm_selected_unit_count": len(stm["selected_units"]),
+        "stm_omitted_unit_count": len(stm["omitted_units"]),
+        "capacity": capacity,
+        "failure_count": failure.get("continuous_session_context_budget_failure_count", 0),
+        "f_failure": failure.get("f_failure", (pressure.get("features") or {}).get("f_failure", 0)),
         "total_context_tokens": context["total_tokens"],
     }
 
@@ -287,30 +341,64 @@ def format_context_status(status):
         f"wm_resolved_title_count: {status.get('wm_resolved_title_count', 0)}",
         f"wm_resident_slot_count: {status.get('wm_resident_slot_count', 0)}",
         f"wm_resident_raw_token_count: {status.get('wm_resident_raw_token_count', 0)}",
+        f"wm_pin_source_slot_seq: {status.get('wm_pin_source_slot_seq')}",
+        f"wm_pin_tokens: {status.get('wm_pin_tokens', 0)}",
+        f"wm_pin_deduplicated: {str(bool(status.get('wm_pin_deduplicated'))).lower()}",
         f"stm_budget: {status.get('stm_budget', 0)}",
         f"stm_raw_budget: {status.get('stm_raw_budget', 0)}",
         f"stm_budget_range: {status.get('stm_min', 0)}..{status.get('stm_max', 0)}",
         f"wm_ingress_watermark: {status.get('wm_ingress_watermark', -1)}",
-        f"watermark_locked_omitted_block_count: {status.get('watermark_locked_omitted_block_count', 0)}",
+        f"watermark_locked_omitted_unit_count: {status.get('watermark_locked_omitted_unit_count', 0)}",
         f"stm_selected_tokens: {status.get('stm_selected_tokens', 0)}",
-        f"stm_selected_block_count: {status.get('stm_selected_block_count', 0)}",
-        f"stm_omitted_block_count: {status.get('stm_omitted_block_count', 0)}",
+        f"stm_selected_unit_count: {status.get('stm_selected_unit_count', 0)}",
+        f"stm_omitted_unit_count: {status.get('stm_omitted_unit_count', 0)}",
+        f"failure_count: {status.get('failure_count', 0)}",
+        f"f_failure: {status.get('f_failure', 0)}",
+        f"stm_base_budget: {(status.get('capacity') or {}).get('stm_base_budget', 0)}",
+        f"stm_required_tokens: {(status.get('capacity') or {}).get('stm_required_tokens', 0)}",
+        f"stm_candidate_budget: {(status.get('capacity') or {}).get('stm_candidate_budget', 0)}",
+        f"stm_effective_budget: {(status.get('capacity') or {}).get('stm_effective_budget', 0)}",
+        f"stm_floor_applied: {str(bool((status.get('capacity') or {}).get('stm_floor_applied'))).lower()}",
+        f"wm_base_budget: {(status.get('capacity') or {}).get('wm_base_budget', 0)}",
+        f"wm_required_tokens: {(status.get('capacity') or {}).get('wm_required_tokens', 0)}",
+        f"wm_candidate_budget: {(status.get('capacity') or {}).get('wm_candidate_budget', 0)}",
+        f"wm_effective_budget: {(status.get('capacity') or {}).get('wm_effective_budget', 0)}",
+        f"wm_floor_applied: {str(bool((status.get('capacity') or {}).get('wm_floor_applied'))).lower()}",
+        f"capacity_recovery_action: {(status.get('capacity') or {}).get('capacity_recovery_action', 'none')}",
         f"total_context_tokens: {status.get('total_context_tokens', 0)}",
     ]
     return "\n".join(lines)
 
 
 def _build_event_stream_context_with_pressure(messages, pressure, runtime_state=None):
-    budgets = pressure.get("budgets") or {}
-    stm_budget = int(budgets.get("stm") or STM_TOKEN_BUDGET)
-    wm_budget = int(budgets.get("wm") or WM_TOKEN_BUDGET)
     watermark = wm_ingress.effective_wm_ingress_watermark(runtime_state)
-    stm_projection = build_stm_projection(messages, budget=stm_budget, wm_ingress_watermark=watermark)
-    wm_records = _build_working_memory_projection(stm_projection, budget=wm_budget)
+    stm_capacity = preview_stm_capacity(messages, pressure, watermark, runtime_state, advance_seq=False)
+    stm_projection = build_stm_projection(messages, budget=stm_capacity["effective_budget"], wm_ingress_watermark=watermark)
+    pin = wm_pins.pin_record(wm_pins.resolve_pin_for_projection(stm_projection, messages, persist=False))
+    pin, wm_requirement, recovery_action = _prepare_working_memory_capacity(
+        stm_projection,
+        pin,
+        pressure,
+        runtime_state=runtime_state,
+        persist=False,
+    )
+    pressure = finalize_capacity_plan(
+        pressure,
+        stm_capacity["required_tokens"],
+        wm_requirement["required_tokens"],
+        persist=False,
+    )
+    pressure["capacity"]["capacity_recovery_action"] = recovery_action
+    budgets = pressure.get("budgets") or {}
+    stm_budget = int(budgets.get("stm") or stm_capacity["effective_budget"])
+    wm_budget = int(budgets.get("wm") or WM_TOKEN_BUDGET)
+    if stm_budget != int(stm_projection.get("budget") or 0):
+        stm_projection = build_stm_projection(messages, budget=stm_budget, wm_ingress_watermark=watermark)
+    wm_records = _build_working_memory_projection(stm_projection, budget=wm_budget, pin=pin)
     wm_message = _build_working_memory_message(wm_records)
     outbound = []
     outbound.extend(_system_messages(stm_projection["messages"]))
-    maintenance_notice = maintenance_pressure.maintenance_pressure_context_notice()
+    maintenance_notice = maintenance_pressure.maintenance_pressure_context_notice(runtime_state=runtime_state)
     if maintenance_notice:
         outbound.append({"role": "system", "content": maintenance_notice})
     if wm_message:
@@ -364,15 +452,19 @@ def _memory_push_for_turn(
     else:
         mode = "incremental" if memory_push_cache.load_latest(root) else "full"
     baseline = memory_push_cache.load_latest(root) if mode == "incremental" else None
-    result = memory_push_ranking.run_memory_push(
-        stm_messages,
-        wm_messages,
-        root=root,
-        runtime_state=runtime_state,
-        mode=mode,
-        baseline=baseline,
-        rank_3_context_messages=rank_3_context_messages,
-    )
+    runtime_state["_memory_push_deadline"] = time.monotonic() + MEMORY_PUSH_FOREGROUND_TIMEOUT_SECONDS
+    try:
+        result = memory_push_ranking.run_memory_push(
+            stm_messages,
+            wm_messages,
+            root=root,
+            runtime_state=runtime_state,
+            mode=mode,
+            baseline=baseline,
+            rank_3_context_messages=rank_3_context_messages,
+        )
+    finally:
+        runtime_state.pop("_memory_push_deadline", None)
     if result.get("status") == "ok":
         memory_push_cache.save(
             root,
@@ -414,17 +506,20 @@ def schedule_memory_push_refresh(messages, runtime_state=None, root=None):
             emit_ui_event(runtime_snapshot, "memory_push_started", path="background", mode="full_background")
             result = None
             try:
-                pressure = compute_and_store_dynamic_context_budget(snapshot, runtime_snapshot, emit_observer=False, stabilize=False)
-                stm_projection = build_stm_projection(
+                pressure = compute_and_store_dynamic_context_budget(
                     snapshot,
-                    budget=int((pressure.get("budgets") or {}).get("stm") or STM_TOKEN_BUDGET),
-                    wm_ingress_watermark=wm_ingress.effective_wm_ingress_watermark(runtime_snapshot),
+                    runtime_snapshot,
+                    emit_observer=False,
+                    stabilize=False,
+                    apply_stabilizer=False,
                 )
-                wm_records = _build_working_memory_projection(
-                    stm_projection,
-                    budget=int((pressure.get("budgets") or {}).get("wm") or WM_TOKEN_BUDGET),
+                context = _build_event_stream_context_with_pressure(
+                    snapshot,
+                    pressure,
+                    runtime_state=runtime_snapshot,
                 )
-                wm_message = _build_working_memory_message(wm_records)
+                stm_projection = context["short_term_memory"]
+                wm_message = _build_working_memory_message(context["working_memory"])
                 rank_3_context_messages = _rank_3_session_messages(
                     runtime_snapshot,
                     root=root,
@@ -522,14 +617,16 @@ def _runtime_copy(runtime_state):
         return dict(runtime_state)
 
 
-def _select_working_memory_records(stm_projection, budget=WM_TOKEN_BUDGET, root=None):
-    records = _working_memory_candidate_records(stm_projection, root=root)
+def _select_working_memory_records(stm_projection, budget=WM_TOKEN_BUDGET, root=None, pin=None):
+    records = _working_memory_candidate_records(stm_projection, root=root, pin=pin)
     selected = []
     selected_tokens = 0
     for record in reversed(records):
         rendered = _render_working_memory_record(record)
         token_count = count_text_tokens(rendered)
         if token_count > budget:
+            if selected:
+                break
             raise RuntimeError(
                 f"Context Builder WM slot exceeds budget: "
                 f"slot_seq={record['slot_seq']}, tokens={token_count}, budget={budget}."
@@ -552,33 +649,103 @@ def _select_working_memory_records(stm_projection, budget=WM_TOKEN_BUDGET, root=
     }
 
 
-def _working_memory_candidate_records(stm_projection, root=None):
+def _working_memory_candidate_records(stm_projection, root=None, pin=None):
     stm_start = _stm_start_index(stm_projection)
     records = (
         event_stream.load_active_trunk_records()
         if root is None
         else event_stream.load_active_trunk_records(root)
     )
+    pin_slot = int(pin.get("source_slot_seq")) if pin else None
     return [
         record
         for record in records
-        if int(record["slot_seq"]) < stm_start and record.get("source") != "system"
+        if int(record["slot_seq"]) < stm_start
+        and record.get("source") != "system"
+        and int(record["slot_seq"]) != pin_slot
     ]
 
 
-def _build_working_memory_projection(stm_projection, budget=WM_TOKEN_BUDGET, root=None):
-    candidates = _working_memory_candidate_records(stm_projection, root=root)
+def _working_memory_requirement(stm_projection, root=None, pin=None):
+    candidates = _working_memory_candidate_records(stm_projection, root=root, pin=pin)
+    if not candidates and not pin:
+        return {"required_tokens": 0, "newest_slot_seq": None}
     focused = focus.build_working_memory_projection(
         candidates,
         _render_working_memory_record,
-        budget,
+        1000000000,
     )
     if focused is not None:
-        return focused
+        content = _working_memory_content_with_pin(focused.get("_required_content"), pin)
+        newest_slot_seq = max([int(record["slot_seq"]) for record in candidates], default=None)
+        return {
+            "required_tokens": count_text_tokens(content) if content else 0,
+            "newest_slot_seq": newest_slot_seq,
+        }
+    newest = []
+    if candidates:
+        record = dict(candidates[-1])
+        record["rendered"] = _render_working_memory_record(record)
+        newest.append(record)
+    content = _legacy_working_memory_content(newest, pin=pin)
+    return {
+        "required_tokens": count_text_tokens(content) if content else 0,
+        "newest_slot_seq": int(newest[0]["slot_seq"]) if newest else None,
+    }
 
-    selected = _select_working_memory_records(stm_projection, budget=budget, root=root)
+
+def _prepare_working_memory_capacity(stm_projection, pin, pressure, runtime_state=None, persist=False):
+    wm_max = int(((pressure.get("budgets") or {}).get("wm_max")) or 0)
+    requirement = _working_memory_requirement(stm_projection, pin=pin)
+    action = "none"
+    if pin and count_text_tokens(_legacy_working_memory_content([], pin=pin)) > wm_max:
+        if persist:
+            wm_pins.clear_current_pin()
+        pin = None
+        action = "unpin_oversized"
+        requirement = _working_memory_requirement(stm_projection, pin=None)
+    if requirement["required_tokens"] > wm_max and persist and requirement.get("newest_slot_seq") is not None:
+        recovery = compact_exact_slot(requirement["newest_slot_seq"], runtime_state=runtime_state)
+        action = str(recovery.get("action") or "bounded_ref")
+        requirement = _working_memory_requirement(stm_projection, pin=pin)
+    return pin, requirement, action
+
+
+def _build_working_memory_projection(stm_projection, budget=WM_TOKEN_BUDGET, root=None, pin=None):
+    candidates = _working_memory_candidate_records(stm_projection, root=root, pin=pin)
+    pin_tokens = count_text_tokens(_legacy_working_memory_content([], pin=pin)) if pin else 0
+    if pin_tokens > budget:
+        raise RuntimeError(
+            "Context Builder WM pin exceeds budget: "
+            f"slot_seq={pin['source_slot_seq']}, tokens={pin_tokens}, budget={budget}."
+        )
+    content_budget = max(1, budget - pin_tokens) if pin else budget
+    focused = focus.build_working_memory_projection(
+        candidates,
+        _render_working_memory_record,
+        content_budget,
+    )
+    if focused is not None:
+        content = _working_memory_content_with_pin(focused.get("content"), pin)
+        selected_tokens = count_text_tokens(content) if content else 0
+        if selected_tokens > budget:
+            raise RuntimeError(
+                "Context Builder WM pin exceeds budget: "
+                f"slot_seq={pin['source_slot_seq']}, tokens={selected_tokens}, budget={budget}."
+            )
+        return {
+            **focused,
+            "budget": budget,
+            "content": content,
+            "selected_tokens": selected_tokens,
+            "pin_source_slot_seq": int(pin["source_slot_seq"]) if pin else None,
+            "pin_tokens": pin_tokens,
+            "pin_deduplicated": bool(pin),
+        }
+
+    selected = _select_working_memory_records(stm_projection, budget=content_budget, root=root, pin=pin)
     selected_records = list(selected["selected_records"])
-    content = _legacy_working_memory_content(selected_records)
+    content = _legacy_working_memory_content(selected_records, pin=pin)
     while selected_records and count_text_tokens(content) > budget:
         if len(selected_records) == 1:
             required_tokens = count_text_tokens(content)
@@ -587,7 +754,7 @@ def _build_working_memory_projection(stm_projection, budget=WM_TOKEN_BUDGET, roo
                 f"slot_seq={selected_records[0]['slot_seq']}, tokens={required_tokens}, budget={budget}."
             )
         selected_records.pop(0)
-        content = _legacy_working_memory_content(selected_records)
+        content = _legacy_working_memory_content(selected_records, pin=pin)
     selected_tokens = count_text_tokens(content) if content else 0
     return {
         **selected,
@@ -610,11 +777,14 @@ def _build_working_memory_projection(stm_projection, budget=WM_TOKEN_BUDGET, roo
             int(record.get("active_token_count") or 0) for record in candidates
         ),
         "skipped_count": max(0, len(candidates) - len(selected_records)),
+        "pin_source_slot_seq": int(pin["source_slot_seq"]) if pin else None,
+        "pin_tokens": pin_tokens,
+        "pin_deduplicated": bool(pin),
     }
 
 
 def _stm_start_index(stm_projection):
-    selected = stm_projection.get("selected_blocks") or []
+    selected = stm_projection.get("selected_units") or []
     if not selected:
         return int(stm_projection.get("wm_ingress_watermark", -1)) + 1
     return min(int(block["start_index"]) for block in selected)
@@ -630,17 +800,31 @@ def _build_working_memory_message(projection):
     }
 
 
-def _legacy_working_memory_content(records):
-    if not records:
+def _legacy_working_memory_content(records, pin=None):
+    if not records and not pin:
         return None
     lines = [
         "<working-memory>",
         "Older active working-memory timeline. Some entries are summaries; raw source remains traceable locally.",
     ]
+    if pin:
+        lines.extend([pin["rendered"], ""])
     for record in records:
         lines.append(record["rendered"])
     lines.append("</working-memory>")
     return "\n".join(lines)
+
+
+def _working_memory_content_with_pin(content, pin):
+    if not pin:
+        return content
+    if not content:
+        return _legacy_working_memory_content([], pin=pin)
+    lines = str(content).splitlines()
+    if lines and lines[0] == "<working-memory>":
+        lines[1:1] = [pin["rendered"], ""]
+        return "\n".join(lines)
+    return _legacy_working_memory_content([], pin=pin)
 
 
 def _render_working_memory_record(record):

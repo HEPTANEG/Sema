@@ -58,16 +58,14 @@ def context_build_preview(messages=None, runtime_state=None):
     source_messages = messages or event_stream.load_messages()
     try:
         pressure = _observer_pressure(source_messages, runtime_copy)
-        budgets = pressure.get("budgets") or {}
-        stm_budget = int(budgets.get("stm") or 10000)
-        wm_budget = int(budgets.get("wm") or 6000)
-        watermark = _read_only_wm_ingress_watermark(runtime_copy)
-        stm = context_builder.build_stm_projection(
+        context = context_builder._build_event_stream_context_with_pressure(
             source_messages,
-            budget=stm_budget,
-            wm_ingress_watermark=watermark,
+            pressure,
+            runtime_state=runtime_copy,
         )
-        wm = context_builder._build_working_memory_projection(stm, budget=wm_budget)
+        pressure = context["context_pressure"]
+        stm = context["short_term_memory"]
+        wm = context["working_memory"]
     except Exception as error:
         return {
             "ok": False,
@@ -77,7 +75,7 @@ def context_build_preview(messages=None, runtime_state=None):
         }
 
     system_tokens = sum(count_message_tokens(message) for message in stm.get("messages", []) if message.get("role") == "system")
-    total_tokens = system_tokens + int(wm.get("selected_tokens", 0)) + int(stm.get("selected_tokens", 0))
+    total_tokens = int(context.get("total_tokens") or 0)
     wm_records = wm.get("selected_records") or []
     return {
         "ok": True,
@@ -109,20 +107,24 @@ def context_build_preview(messages=None, runtime_state=None):
             "resolved_title_count": wm.get("resolved_title_count", 0),
             "resident_slot_count": wm.get("resident_slot_count", 0),
             "resident_raw_token_count": wm.get("resident_raw_token_count", 0),
+            "pin_source_slot_seq": wm.get("pin_source_slot_seq"),
+            "pin_tokens": wm.get("pin_tokens", 0),
+            "pin_deduplicated": bool(wm.get("pin_deduplicated")),
         },
         "short_term_memory": {
             "budget": stm.get("budget", 0),
             "selected_tokens": stm.get("selected_tokens", 0),
-            "selected_blocks": [_block_metadata(block) for block in stm.get("selected_blocks") or []],
-            "omitted_blocks": [_block_metadata(block) for block in stm.get("omitted_blocks") or []],
-            "latest_block_tokens": stm.get("latest_block_tokens", 0),
-            "watermark_locked_omitted_block_count": stm.get("watermark_locked_omitted_block_count", 0),
+            "selected_units": [_unit_metadata(unit) for unit in stm.get("selected_units") or []],
+            "omitted_units": [_unit_metadata(unit) for unit in stm.get("omitted_units") or []],
+            "latest_unit_tokens": stm.get("latest_unit_tokens", 0),
+            "watermark_locked_omitted_unit_count": stm.get("watermark_locked_omitted_unit_count", 0),
             "wm_ingress_watermark": stm.get("wm_ingress_watermark", -1),
         },
         "context_pressure": {
             "scores": pressure.get("scores") or {},
             "budgets": pressure.get("budgets") or {},
             "stabilizer": pressure.get("stabilizer") or {},
+            "capacity": pressure.get("capacity") or {},
         },
     }
 
@@ -147,8 +149,8 @@ def format_memory_engine_snapshot(snapshot):
         f"artifact_count: {storage.get('artifact_count', 0)}",
         f"context_preview_ok: {str(bool(preview.get('ok'))).lower()}",
         f"total_estimated_tokens: {preview.get('total_estimated_tokens', 'unavailable')}",
-        f"stm_selected_blocks: {len(((preview.get('short_term_memory') or {}).get('selected_blocks') or []))}",
-        f"stm_omitted_blocks: {len(((preview.get('short_term_memory') or {}).get('omitted_blocks') or []))}",
+        f"stm_selected_units: {len(((preview.get('short_term_memory') or {}).get('selected_units') or []))}",
+        f"stm_omitted_units: {len(((preview.get('short_term_memory') or {}).get('omitted_units') or []))}",
         f"wm_selected_count: {(preview.get('working_memory') or {}).get('selected_count', 0)}",
         f"wm_projection_mode: {(preview.get('working_memory') or {}).get('projection_mode', 'legacy')}",
         f"wm_metadata_tokens: {(preview.get('working_memory') or {}).get('metadata_tokens', 0)}",
@@ -464,11 +466,11 @@ def _slot_range(records):
     return f"{records[0]['slot_seq']}..{records[-1]['slot_seq']}"
 
 
-def _block_metadata(block):
+def _unit_metadata(unit):
     return {
-        "kind": block.get("kind", "interaction"),
-        "start_index": int(block.get("start_index", 0)),
-        "end_index": int(block.get("end_index", 0)),
-        "message_count": int(block.get("message_count", 0)),
-        "token_count": int(block.get("token_count", 0)),
+        "kind": unit.get("kind", "orphan"),
+        "start_index": int(unit.get("start_index", 0)),
+        "end_index": int(unit.get("end_index", 0)),
+        "message_count": int(unit.get("message_count", 0)),
+        "token_count": int(unit.get("token_count", 0)),
     }

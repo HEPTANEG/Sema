@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest';
-import {matchingSlashCommands, resolveSlashCommandInput} from './slash.js';
+import {matchingSlashCommands, resolveSemaSlashInput, resolveSlashCommandInput} from './slash.js';
 
 describe('matchingSlashCommands', () => {
   it('matches slash commands by prefix', () => {
@@ -45,6 +45,18 @@ describe('matchingSlashCommands', () => {
       {name: '/memory budget reset', help: 'reset budget'}
     ]);
     expect(resolveSlashCommandInput(commands, '/memory budget re')).toBe('/memory budget reset');
+  });
+
+  it('preserves arguments after a completed multi-word command', () => {
+    const commands = [
+      {name: '/memory', help: 'memory'},
+      {name: '/memory budget status', help: 'status'},
+      {name: '/memory budget set', help: 'set budget'},
+      {name: '/memory budget reset', help: 'reset budget'}
+    ];
+
+    expect(resolveSemaSlashInput(commands, '/memory budget set both 2000'))
+      .toBe('/memory budget set both 2000');
   });
 
   it('resolves a small typo when the intended command is unambiguous', () => {

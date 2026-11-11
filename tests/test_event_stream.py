@@ -356,7 +356,7 @@ def test_event_stream_memory_status_and_commands(isolated_workspace):
     assert "ok: true" in event_check["content"]
     stm_status = execute_slash_command("/memory stm status", messages, permissions, runtime_state, lambda: _messages())
     assert "STM Projection status:" in stm_status["content"]
-    assert "selected_block_count:" in stm_status["content"]
+    assert "selected_unit_count:" in stm_status["content"]
     assert "hello" not in stm_status["content"]
     context_status = execute_slash_command("/memory context status", messages, permissions, runtime_state, lambda: _messages())
     assert "Context Builder status:" in context_status["content"]
@@ -409,14 +409,14 @@ def test_event_stream_stm_status_reports_projection_error(isolated_workspace):
     session.ensure_project()
     messages = [
         {"role": "system", "content": "system"},
-        {"role": "user", "content": "测试" * 12000},
+        {"role": "user", "content": "测试" * 60000},
     ]
 
     result = execute_slash_command("/memory stm status", messages, {}, {}, lambda: messages)
 
     assert "STM Projection status:" in result["content"]
     assert "status: error" in result["content"]
-    assert "STM latest interaction block exceeds budget" in result["content"]
+    assert "Context capacity exceeded: target=stm" in result["content"]
 
 
 def test_event_stream_context_status_reports_projection_error(isolated_workspace, monkeypatch):
@@ -442,7 +442,7 @@ def test_event_stream_context_status_reports_projection_error(isolated_workspace
     assert "Context Builder WM slot exceeds budget" in result["content"]
 
 
-def test_event_stream_stm_status_shows_omitted_block_metadata(isolated_workspace):
+def test_event_stream_stm_status_shows_omitted_unit_metadata(isolated_workspace):
     from persistence import session
     from commands.structured_commands import execute_slash_command
 
@@ -459,8 +459,8 @@ def test_event_stream_stm_status_shows_omitted_block_metadata(isolated_workspace
 
     result = execute_slash_command("/memory stm status", messages, {}, {}, lambda: messages)
 
-    assert "omitted_blocks:" in result["content"]
-    assert "range=1..2" in result["content"]
+    assert "omitted_units:" in result["content"]
+    assert "range=1..1" in result["content"]
     assert "tokens=" in result["content"]
     assert old_text not in result["content"]
     assert latest_text not in result["content"]
@@ -554,7 +554,7 @@ def test_event_stream_background_tasks_run_event_stream_maintenance(isolated_wor
             "ui_event": lambda *args, **kwargs: calls.append((args, kwargs)),
             "trace_event": lambda *args, **kwargs: calls.append(("trace", args, kwargs)),
             "threading": type("Threading", (), {"Thread": ImmediateThread}),
-            "stage_wm_ingress_from_messages": lambda current, state=None: calls.append(("stage", list(current), state)) or {"staged_watermark": 2, "stm_budget": 10000, "omitted_block_count": 1},
+            "stage_wm_ingress_from_messages": lambda current, state=None: calls.append(("stage", list(current), state)) or {"staged_watermark": 2, "stm_budget": 10000, "omitted_unit_count": 1},
             "commit_staged_wm_ingress_watermark": lambda state=None: calls.append(("commit", state)) or {"updated": True, "persisted_watermark": 2, "staged_watermark": 2, "effective_watermark": 2},
             "run_working_memory_maintenance": lambda current, runtime_state=None: calls.append(("wm", list(current))) or {"triggered": True, "updated": True, "reason": "wm"},
             "run_segment_ingest_maintenance": lambda current, state=None: calls.append(("ingest", list(current), state)) or {"triggered": True, "updated": True, "reason": "ingest", "processed_block_count": 1, "assigned_count": 1, "unassigned_count": 0, "resolved_count": 0},

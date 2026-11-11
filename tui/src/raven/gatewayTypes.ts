@@ -666,4 +666,5 @@ export type GatewayEvent =
     }
   | { payload?: { message?: string }; session_id?: string; type: 'error' }
   | { payload: { wake_id?: string; source?: string; kind?: string; processing_class?: string }; session_id?: string; type: 'wake_delivered' }
-  | { payload: { wake_id?: string; error?: string }; session_id?: string; type: 'wake_failed' }
+  | { payload: { wake_id?: string; attempt?: number; reason?: string }; session_id?: string; type: 'wake_deferred' }
+  | { payload: { wake_id?: string; error?: string; attempt?: number; reason?: string }; session_id?: string; type: 'wake_failed' }

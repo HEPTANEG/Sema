@@ -3,8 +3,11 @@
 import json
 import math
 import os
+import subprocess
+import sys
 import threading
 from collections.abc import Mapping
+from pathlib import Path
 from uuid import uuid4
 
 from .. import event_stream
@@ -345,6 +348,45 @@ class VectorIndexAdapter:
                 raise VectorIndexUnavailable(str(error)) from error
 
     def stage_upserts(self, items, *, remove_ids=()):
+        token = uuid4().hex
+        directory = self.index_path.parent
+        paths = [directory / f"{INDEX_FILE_NAME}.{token}.seed",
+                 directory / f"{INDEX_FILE_NAME}.stage.{token}",
+                 directory / f"{METADATA_FILE_NAME}.stage.{token}"]
+        payload = {"root": str(Path(self.root or Path.cwd()).resolve()),
+                   "items": [{"object_id": item["object_id"], "vector": [float(x) for x in item["vector"]]} for item in items],
+                   "remove_ids": list(remove_ids), "token": token}
+        environment = os.environ.copy()
+        agent_path = str(Path(__file__).resolve().parents[2])
+        environment["PYTHONPATH"] = os.pathsep.join(filter(None, (agent_path, environment.get("PYTHONPATH", ""))))
+        with self._lock:
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "memory_engine.ltm.vector_stage_worker"],
+                    input=json.dumps(payload), capture_output=True, text=True,
+                    encoding="utf-8", env=environment, timeout=120,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if result.returncode:
+                    raise VectorIndexUnavailable(f"Vector staging worker exited with code {result.returncode}: {result.stderr[-1000:]}")
+                output = json.loads(result.stdout)
+                if output.get("status") != "ok":
+                    raise VectorIndexUnavailable(output.get("error", "Vector staging worker failed."))
+                staged = output["staged"]
+                if Path(staged["index_path"]) != paths[1] or Path(staged["metadata_path"]) != paths[2]:
+                    raise VectorIndexUnavailable("Vector staging worker returned unexpected paths.")
+                return staged
+            except Exception as error:
+                for path in paths:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                if isinstance(error, VectorIndexUnavailable):
+                    raise
+                raise VectorIndexUnavailable(f"Vector staging worker failed: {error}") from error
+
+    def _stage_upserts_in_process(self, items, *, remove_ids=(), token):
         """Write a complete replacement index to temporary files without installing it."""
         normalized = []
         for item in items:
@@ -357,7 +399,7 @@ class VectorIndexAdapter:
                     index = self._new_index()
                     metadata = _metadata_with_mapping({}, 0)
                 else:
-                    seed = self.index_path.parent / f"{INDEX_FILE_NAME}.{uuid4().hex}.seed"
+                    seed = self.index_path.parent / f"{INDEX_FILE_NAME}.{token}.seed"
                     self._index.save(str(seed))
                     index = Index.restore(str(seed))
                     seed.unlink(missing_ok=True)
@@ -379,7 +421,7 @@ class VectorIndexAdapter:
                         index.remove(int(label))
                     index.add(int(label), vector)
                 metadata = _metadata_with_mapping(object_to_label, next_label)
-                suffix = f".stage.{uuid4().hex}"
+                suffix = f".stage.{token}"
                 staged_index = self.index_path.parent / f"{INDEX_FILE_NAME}{suffix}"
                 staged_metadata = self.index_path.parent / f"{METADATA_FILE_NAME}{suffix}"
                 staged_index.parent.mkdir(parents=True, exist_ok=True)
@@ -529,18 +571,37 @@ def sync_committed_objects(object_ids, root=None, runtime_state=None):
     return result
 
 
-def stage_object_upserts(objects, root=None):
+def stage_object_upserts(objects, root=None, timeout_seconds=None, phase_callback=None):
     """Embed canonical object projections and stage, but do not install, vector changes."""
     objects = list(objects or [])
     if not objects:
         return None
     projections = [build_embedding_projection(obj) for obj in objects]
-    batch = embed_documents(projections)
+    def phase(name, status):
+        if phase_callback is not None:
+            try:
+                phase_callback(name, status, {})
+            except Exception:
+                pass
+    phase("embedding_request", "started")
+    try:
+        batch = embed_documents(projections) if timeout_seconds is None else embed_documents(projections, timeout_seconds=timeout_seconds)
+    except Exception:
+        phase("embedding_request", "failed")
+        raise
+    phase("embedding_request", "completed")
     items = [
         {"object_id": obj["object_id"], "vector": vector}
         for obj, vector in zip(objects, batch.vectors)
     ]
-    return get_vector_index(root).stage_upserts(items)
+    phase("vector_index_staging", "started")
+    try:
+        result = get_vector_index(root).stage_upserts(items)
+    except Exception:
+        phase("vector_index_staging", "failed")
+        raise
+    phase("vector_index_staging", "completed")
+    return result
 
 
 def install_staged_vector(staged, root=None):

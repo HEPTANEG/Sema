@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,10 @@ STARTUP_DIAGNOSTIC_CHARS = 2000
 
 class EmbeddingServiceError(RuntimeError):
     """Raised when the local embedding service cannot fulfil a request."""
+
+
+class EmbeddingServiceTimeout(EmbeddingServiceError):
+    """Raised when the local embedding service exceeds its request budget."""
 
 
 @dataclass(frozen=True)
@@ -93,7 +98,8 @@ class EmbeddingAdapter:
         detail = self._startup_diagnostics()
         return EmbeddingServiceError(f"{message} Startup diagnostics: {detail}" if detail else message)
 
-    def _start_once(self):
+    def _start_once(self, timeout_seconds=None):
+        startup_timeout = self.startup_timeout if timeout_seconds is None else max(0.1, min(self.startup_timeout, float(timeout_seconds)))
         environment = os.environ.copy()
         environment["HF_HUB_OFFLINE"] = "1"
         _prepend_python_path(environment)
@@ -132,9 +138,9 @@ class EmbeddingAdapter:
             daemon=True,
         ).start()
         try:
-            line = ready_queue.get(timeout=self.startup_timeout)
+            line = ready_queue.get(timeout=startup_timeout)
         except Empty as error:
-            raise self._startup_error("Embedding Service did not become ready in time.") from error
+            raise EmbeddingServiceTimeout(str(self._startup_error("Embedding Service did not become ready in time."))) from error
         if isinstance(line, Exception):
             raise self._startup_error("Embedding Service readiness pipe failed.") from line
         if not line:
@@ -152,29 +158,38 @@ class EmbeddingAdapter:
                 f"Embedding Service returned an invalid readiness message: {preview!r}."
             ) from error
         self._base_url = f"http://127.0.0.1:{port}"
-        health = self._request_json("GET", "/health")
+        health = self._request_json("GET", "/health", timeout_seconds=startup_timeout)
         if health.get("status") != "ready" or health.get("dimension") != EXPECTED_DIMENSION:
             raise self._startup_error("Embedding Service health check failed.")
 
-    def _ensure_started(self):
+    def _ensure_started(self, timeout_seconds=None):
         with self._lock:
             if self._process is not None and self._process.poll() is None and self._base_url:
                 return
             last_error = None
+            deadline = None if timeout_seconds is None else time.monotonic() + float(timeout_seconds)
             for _attempt in range(STARTUP_ATTEMPTS):
                 try:
-                    self._start_once()
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        raise EmbeddingServiceTimeout("Embedding Service startup exceeded the Memory Push time budget.")
+                    if remaining is None:
+                        self._start_once()
+                    else:
+                        self._start_once(timeout_seconds=remaining)
                     return
                 except EmbeddingServiceError as error:
                     last_error = error
                     self.close()
             if last_error is not None:
+                if isinstance(last_error, EmbeddingServiceTimeout):
+                    raise last_error
                 raise EmbeddingServiceError(
                     f"Embedding Service failed to start after {STARTUP_ATTEMPTS} attempts. {last_error}"
                 ) from last_error
             raise EmbeddingServiceError("Embedding Service failed to start.")
 
-    def _request_json(self, method, path, payload=None):
+    def _request_json(self, method, path, payload=None, timeout_seconds=None):
         data = None
         headers = {}
         if payload is not None:
@@ -182,7 +197,7 @@ class EmbeddingAdapter:
             headers["Content-Type"] = "application/json"
         request = Request(f"{self._base_url}{path}", data=data, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=self.request_timeout) as response:
+            with urlopen(request, timeout=timeout_seconds or self.request_timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             try:
@@ -191,13 +206,17 @@ class EmbeddingAdapter:
                 detail = {"error": {"message": str(error)}}
             message = detail.get("error", {}).get("message", str(error))
             raise EmbeddingServiceError(message) from error
+        except TimeoutError as error:
+            self.close()
+            raise EmbeddingServiceTimeout(f"Embedding Service request exceeded its timeout: {error}") from error
         except (URLError, OSError, json.JSONDecodeError) as error:
             raise EmbeddingServiceError(f"Embedding Service request failed: {error}") from error
 
-    def _embed(self, texts, input_kind, _diagnostic_profiler=None):
+    def _embed(self, texts, input_kind, _diagnostic_profiler=None, timeout_seconds=None):
         if not isinstance(texts, (list, tuple)) or not texts or any(not isinstance(text, str) for text in texts):
             raise ValueError("texts must be a non-empty sequence of strings.")
         with self._lock:
+            deadline = None if timeout_seconds is None else time.monotonic() + float(timeout_seconds)
             process = self._process
             process_running = process is not None and (
                 not hasattr(process, "poll") or process.poll() is None
@@ -207,13 +226,40 @@ class EmbeddingAdapter:
                 if not was_started:
                     _diagnostic_profiler.mark_cold_start("embedding")
                 with _diagnostic_profiler.measure("embedding_service_startup_ms"):
-                    self._ensure_started()
+                    if deadline is None:
+                        self._ensure_started()
+                    else:
+                        self._ensure_started(timeout_seconds=max(0.1, deadline - time.monotonic()))
                 _diagnostic_profiler.increment("embedding_request_count")
                 with _diagnostic_profiler.measure("embedding_request_ms"):
-                    result = self._request_json("POST", "/embed", {"texts": list(texts), "input_kind": input_kind})
+                    payload = {"texts": list(texts), "input_kind": input_kind}
+                    if deadline is None:
+                        result = self._request_json("POST", "/embed", payload)
+                    else:
+                        result = self._request_json(
+                            "POST",
+                            "/embed",
+                            payload,
+                            timeout_seconds=max(0.1, deadline - time.monotonic()),
+                        )
             else:
-                self._ensure_started()
-                result = self._request_json("POST", "/embed", {"texts": list(texts), "input_kind": input_kind})
+                if deadline is None:
+                    self._ensure_started()
+                else:
+                    self._ensure_started(timeout_seconds=max(0.1, deadline - time.monotonic()))
+                payload = {"texts": list(texts), "input_kind": input_kind}
+                if deadline is None:
+                    result = self._request_json("POST", "/embed", payload)
+                else:
+                    result = self._request_json(
+                        "POST",
+                        "/embed",
+                        payload,
+                        timeout_seconds=max(0.1, deadline - time.monotonic()),
+                    )
+        if deadline is not None and time.monotonic() > deadline:
+            self.close()
+            raise EmbeddingServiceTimeout("Embedding Service request exceeded its overall timeout.")
         if result.get("model") != MODEL_NAME or result.get("dimension") != EXPECTED_DIMENSION:
             raise EmbeddingServiceError("Embedding Service returned incompatible model metadata.")
         rows = result.get("vectors")
@@ -230,11 +276,11 @@ class EmbeddingAdapter:
             vectors.append(values)
         return EmbeddingBatch(MODEL_NAME, EXPECTED_DIMENSION, tuple(vectors))
 
-    def embed_documents(self, texts, _diagnostic_profiler=None):
-        return self._embed(texts, "document", _diagnostic_profiler=_diagnostic_profiler)
+    def embed_documents(self, texts, _diagnostic_profiler=None, timeout_seconds=None):
+        return self._embed(texts, "document", _diagnostic_profiler=_diagnostic_profiler, timeout_seconds=timeout_seconds)
 
-    def embed_queries(self, texts, _diagnostic_profiler=None):
-        return self._embed(texts, "query", _diagnostic_profiler=_diagnostic_profiler)
+    def embed_queries(self, texts, _diagnostic_profiler=None, timeout_seconds=None):
+        return self._embed(texts, "query", _diagnostic_profiler=_diagnostic_profiler, timeout_seconds=timeout_seconds)
 
     def close(self):
         with self._lock:
@@ -278,18 +324,18 @@ def _get_default_adapter():
         return _default_adapter
 
 
-def embed_documents(texts, _diagnostic_profiler=None):
+def embed_documents(texts, _diagnostic_profiler=None, timeout_seconds=None):
     adapter = _get_default_adapter()
     if _diagnostic_profiler is None:
-        return adapter.embed_documents(texts)
-    return adapter.embed_documents(texts, _diagnostic_profiler=_diagnostic_profiler)
+        return adapter.embed_documents(texts, timeout_seconds=timeout_seconds)
+    return adapter.embed_documents(texts, _diagnostic_profiler=_diagnostic_profiler, timeout_seconds=timeout_seconds)
 
 
-def embed_queries(texts, _diagnostic_profiler=None):
+def embed_queries(texts, _diagnostic_profiler=None, timeout_seconds=None):
     adapter = _get_default_adapter()
     if _diagnostic_profiler is None:
-        return adapter.embed_queries(texts)
-    return adapter.embed_queries(texts, _diagnostic_profiler=_diagnostic_profiler)
+        return adapter.embed_queries(texts, timeout_seconds=timeout_seconds)
+    return adapter.embed_queries(texts, _diagnostic_profiler=_diagnostic_profiler, timeout_seconds=timeout_seconds)
 
 
 def close_default_adapter():

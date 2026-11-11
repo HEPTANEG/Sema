@@ -38,6 +38,6 @@ def test_current_bridge_event_contract_covers_runtime_and_tui_events():
             "retriever_started", "retriever_finished",
         "wm_ingress_watermark_status", "working_memory_status",
         "focus_segment_status", "ltm_formation_status", "cancel_requested", "turn_cancelled",
-            "agent_stopped", "agent_error", "error", "wake_delivered", "wake_failed",
+            "agent_stopped", "agent_error", "error", "wake_delivered", "wake_deferred", "wake_failed",
     }
     assert expected == set(EVENT_SCHEMAS)

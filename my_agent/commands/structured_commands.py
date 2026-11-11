@@ -5,6 +5,7 @@ from pathlib import Path
 from commands.command_registry import format_help, list_slash_commands
 from commands.dispatch import dispatch_command
 from memory_engine.context_builder import context_status, format_context_status
+from memory_engine.capacity_planner import preview_stm_capacity
 from memory_engine.state import build_memory_engine_state, format_memory_engine_state
 from memory_engine.dynamic_context_budget import compute_and_store_dynamic_context_budget, format_context_pressure_status
 from memory_engine.context_budget_override import reset_budget_override, set_budget_override
@@ -423,11 +424,18 @@ def format_stm_status(messages, runtime_state=None):
         raw_budget = None
         watermark = -1
         watermark_status = {}
-        pressure = compute_and_store_dynamic_context_budget(messages or [], runtime_state, emit_observer=False, stabilize=False)
+        pressure = compute_and_store_dynamic_context_budget(
+            messages or [],
+            runtime_state,
+            emit_observer=False,
+            stabilize=False,
+            apply_stabilizer=False,
+        )
         budgets = pressure.get("budgets") or {}
-        budget = budgets.get("stm")
-        raw_budget = budgets.get("stm_raw", budgets.get("stm"))
         watermark = effective_wm_ingress_watermark(runtime_state)
+        capacity = preview_stm_capacity(messages or [], pressure, watermark, runtime_state, advance_seq=False)
+        budget = capacity["effective_budget"]
+        raw_budget = budgets.get("stm_raw", budgets.get("stm"))
         watermark_status = wm_ingress_watermark_status(runtime_state)
         status = stm_projection_status(messages, budget=budget or STM_TOKEN_BUDGET, wm_ingress_watermark=watermark)
     except RuntimeError as error:
@@ -446,28 +454,28 @@ def format_stm_status(messages, runtime_state=None):
         f"persisted_wm_ingress_watermark: {watermark_status.get('persisted_watermark', -1)}",
         f"staged_wm_ingress_watermark: {watermark_status.get('staged_watermark', -1)}",
         f"effective_wm_ingress_watermark: {status.get('wm_ingress_watermark', -1)}",
-        f"watermark_locked_omitted_block_count: {status.get('watermark_locked_omitted_block_count', 0)}",
+        f"watermark_locked_omitted_unit_count: {status.get('watermark_locked_omitted_unit_count', 0)}",
         f"selected_tokens: {status.get('selected_tokens', 0)}",
         f"omitted_tokens: {status.get('omitted_tokens', 0)}",
-        f"total_block_tokens: {status.get('total_block_tokens', 0)}",
+        f"total_unit_tokens: {status.get('total_unit_tokens', 0)}",
         f"budget_used_ratio: {status.get('budget_used_ratio', 0)}",
         f"total_message_count: {status.get('total_message_count', 0)}",
         f"non_system_message_count: {status.get('non_system_message_count', 0)}",
-        f"selected_block_count: {status.get('selected_block_count', 0)}",
-        f"omitted_block_count: {status.get('omitted_block_count', 0)}",
-        f"latest_block_tokens: {status.get('latest_block_tokens', 0)}",
-        f"largest_block_tokens: {status.get('largest_block_tokens', 0)}",
-        f"total_block_count: {status.get('total_block_count', 0)}",
-        "selected_blocks:",
+        f"selected_unit_count: {status.get('selected_unit_count', 0)}",
+        f"omitted_unit_count: {status.get('omitted_unit_count', 0)}",
+        f"latest_unit_tokens: {status.get('latest_unit_tokens', 0)}",
+        f"largest_unit_tokens: {status.get('largest_unit_tokens', 0)}",
+        f"total_unit_count: {status.get('total_unit_count', 0)}",
+        "selected_units:",
     ]
-    for block in status.get("selected_blocks", []):
-        lines.append(_format_stm_block(block))
-    if not status.get("selected_blocks"):
+    for unit in status.get("selected_units", []):
+        lines.append(_format_stm_block(unit))
+    if not status.get("selected_units"):
         lines.append("- none")
-    lines.append("omitted_blocks:")
-    for block in status.get("omitted_blocks", []):
-        lines.append(_format_stm_block(block))
-    if not status.get("omitted_blocks"):
+    lines.append("omitted_units:")
+    for unit in status.get("omitted_units", []):
+        lines.append(_format_stm_block(unit))
+    if not status.get("omitted_units"):
         lines.append("- none")
     return "\n".join(lines)
 

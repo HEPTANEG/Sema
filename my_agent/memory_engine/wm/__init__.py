@@ -16,17 +16,25 @@ from .ingress import (
     wm_ingress_watermark_status,
 )
 from .working_memory import (
+    compact_exact_slot,
     format_working_memory_run,
     format_working_memory_status,
-    run_preflight_working_memory_recovery,
     run_working_memory_maintenance,
     working_memory_status,
+)
+from .pins import (
+    clear_current_pin,
+    load_current_pin,
+    on_message_persisted,
+    pin_record,
+    pin_status,
+    resolve_pin_for_projection,
 )
 
 __all__ = [
     "working_memory_status",
+    "compact_exact_slot",
     "run_working_memory_maintenance",
-    "run_preflight_working_memory_recovery",
     "format_working_memory_status",
     "format_working_memory_run",
     "STATE_TABLE",
@@ -42,4 +50,10 @@ __all__ = [
     "stage_wm_ingress_from_messages",
     "commit_staged_wm_ingress_watermark",
     "wm_ingress_watermark_status",
+    "clear_current_pin",
+    "load_current_pin",
+    "on_message_persisted",
+    "pin_record",
+    "pin_status",
+    "resolve_pin_for_projection",
 ]

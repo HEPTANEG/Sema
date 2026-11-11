@@ -16,6 +16,7 @@ STRUCTURED_LOOP_REQUIRED_DEPENDENCIES = (
     "expire_image_context",
     "format_tool_error",
     "finish_trace_span",
+    "guard_tool_result",
     "mark_assistant_turn_finished",
     "pop_last_edit_stats",
     "record_tool_step",
@@ -47,13 +48,48 @@ def run_structured_loop(messages, permissions=None, runtime_state=None, dependen
     failure_counts = {}
     while True:
         dependencies["check_cancel_requested"](runtime_state)
+        from runtime.setup_capabilities import ltm_enabled
+        from runtime.maintenance_sleep import (
+            MaintenanceControlRequested,
+            continuation,
+            prepare_request_decision,
+            request_decision,
+        )
+        continuation_at_request = continuation(runtime_state)
+        failure_at_request = bool(continuation_at_request and continuation_at_request.get("status") in {"failed", "handed_off"})
         assistant_message = dependencies["call_model_with_structured_retries"](messages, runtime_state)
+        decision = request_decision(runtime_state)
+        if decision is None and ltm_enabled():
+            decision = prepare_request_decision(runtime_state)
         provider_context_messages = assistant_message.pop("_provider_context_messages", None)
         content = assistant_message.get("content") or ""
         tool_calls = assistant_message.get("tool_calls") or []
         message_id = assistant_message.get("message_id")
 
+        maintenance_failed = failure_at_request
+        mandatory_sleep = bool(decision and decision.get("mode") == "mandatory" and not maintenance_failed)
+        requested_tools = []
+        for call in tool_calls:
+            function = call.get("function") or {}
+            requested_tools.append(function.get("name") or "")
+        control_tools = {"sleep_for_maintenance", "retry_ltm_maintenance", "return_maintenance_failure"}
+        allowed_control = {"retry_ltm_maintenance", "return_maintenance_failure"} if maintenance_failed else {"sleep_for_maintenance"}
+        invalid_boundary_response = (
+            (mandatory_sleep and (len(requested_tools) != 1 or requested_tools[0] != "sleep_for_maintenance"))
+            or (maintenance_failed and (len(requested_tools) != 1 or requested_tools[0] not in allowed_control))
+            or (any(name in control_tools for name in requested_tools) and (len(requested_tools) != 1 or requested_tools[0] not in allowed_control))
+        )
+
         if not tool_calls:
+            if mandatory_sleep or maintenance_failed:
+                reason = (
+                    "Maintenance is mandatory now. Call sleep_for_maintenance alone and include a useful wake_prompt."
+                    if mandatory_sleep else
+                    "The original task remains paused after maintenance failure. Call retry_ltm_maintenance or return_maintenance_failure alone."
+                )
+                dependencies["append_message_and_persist"](messages, {"role": "user", "source": "runtime", "content": f"Runtime boundary: {reason}"})
+                dependencies["trace_event"](runtime_state, "maintenance.boundary_rejected", status="rejected", reason=reason)
+                continue
             dependencies["append_message_and_persist"](
                 messages,
                 dependencies["assistant_history_message"](assistant_message),
@@ -80,7 +116,26 @@ def run_structured_loop(messages, permissions=None, runtime_state=None, dependen
             dependencies["mark_assistant_turn_finished"](runtime_state)
             dependencies["schedule_final_answer_background_tasks"](messages, runtime_state)
             dependencies["trace_event"](runtime_state, "final", status="ok", path="structured", content_chars=len(content))
+            if runtime_state and runtime_state.pop("maintenance_resume_wake", False):
+                runtime_state["maintenance_continuation"] = None
             return
+
+        if invalid_boundary_response:
+            dependencies["append_message_and_persist"](messages, dependencies["assistant_history_message"](assistant_message, tool_calls=tool_calls))
+            reason = (
+                "Maintenance is mandatory. Only sleep_for_maintenance with a valid wake_prompt may be called, alone."
+                if mandatory_sleep else
+                "After maintenance failure, only retry_ltm_maintenance or return_maintenance_failure may be called, alone."
+            )
+            for call in tool_calls:
+                dependencies["append_message_and_persist"](messages, {
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "content": f"Runtime rejected this tool batch: {reason}",
+                })
+            dependencies["append_message_and_persist"](messages, {"role": "user", "source": "runtime", "content": f"Runtime boundary: {reason}"})
+            dependencies["trace_event"](runtime_state, "maintenance.boundary_rejected", status="rejected", requested_tools=requested_tools, reason=reason)
+            continue
 
         for tool_call in tool_calls:
             if not tool_call.get("id"):
@@ -242,12 +297,34 @@ def run_structured_loop(messages, permissions=None, runtime_state=None, dependen
                 RuntimeError(tool_error) if tool_error else None,
                 metadata={"tool": tool, "item_id": item_id},
             )
+            provider_tool_result = dependencies["build_structured_tool_result_message"](tool, tool_result)
+            guarded_result = dependencies["guard_tool_result"](
+                tool,
+                provider_tool_result,
+                tool_call_id,
+                messages,
+                runtime_state=runtime_state,
+            )
+            if guarded_result.get("status") != "ok":
+                dependencies["trace_event"](
+                    runtime_state,
+                    "tool_ingress_guard",
+                    status=guarded_result.get("status"),
+                    tool=tool,
+                    bundle_tokens=guarded_result.get("bundle_tokens", 0),
+                    maximum=guarded_result.get("maximum", 0),
+                    artifact_id=guarded_result.get("artifact_id") or "",
+                )
             dependencies["append_message_and_persist"](
                 messages,
                 {
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": dependencies["build_structured_tool_result_message"](tool, tool_result),
+                    "content": guarded_result["content"],
                 },
             )
             dependencies["check_cancel_requested"](runtime_state)
+
+        control_action = (runtime_state or {}).pop("_maintenance_control_action", None)
+        if control_action:
+            raise MaintenanceControlRequested(control_action)

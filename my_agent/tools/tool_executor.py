@@ -310,6 +310,89 @@ def _run_memorize(tool_request, context):
     return context.hooks.json_dumps(result)
 
 
+def _run_sleep_for_maintenance(tool_request, context):
+    state = context.runtime_state
+    if not isinstance(state, dict):
+        raise RuntimeError("Maintenance sleep is unavailable outside the Main Agent Runtime.")
+    from memory_engine.ltm.maintenance_pressure import maintenance_pressure_snapshot
+    from runtime.maintenance_sleep import (
+        continuation,
+        mandatory_latch,
+        pressure_trace_fields,
+        request_decision,
+        sleep_is_authorized,
+    )
+    decision = request_decision(state)
+    latch = mandatory_latch(state)
+    if not sleep_is_authorized(state):
+        raise RuntimeError("sleep_for_maintenance is available only at pressure 0.5 or higher.")
+    active_continuation = continuation(state)
+    if active_continuation and active_continuation.get("status") != "resuming":
+        raise RuntimeError("A maintenance continuation is already active.")
+    if active_continuation:
+        context.hooks.trace_event(
+            state,
+            "maintenance.resuming_continuation_reaccepted",
+            status="ok",
+            continuation_id=active_continuation.get("continuation_id") or "",
+        )
+    wake_prompt = str((tool_request.get("args") or {}).get("wake_prompt") or "").strip()
+    if len(wake_prompt) < 12:
+        raise RuntimeError("wake_prompt must identify the task, current progress, and next step.")
+    decision_snapshot = (decision or {}).get("snapshot") or (latch or {}).get("snapshot") or {}
+    execution_snapshot = maintenance_pressure_snapshot()
+    changed = any(
+        decision_snapshot.get(key) != execution_snapshot.get(key)
+        for key in (
+            "pressure",
+            "maintenance_coverage_cursor",
+            "maintainable_frontier",
+            "latest_event_stream_slot_seq",
+        )
+    )
+    if changed:
+        context.hooks.trace_event(
+            state,
+            "maintenance.pressure_changed_before_sleep",
+            status="ok",
+            mode=(decision or {}).get("mode") or "mandatory",
+            request_index=(decision or {}).get("request_index") or (latch or {}).get("request_index") or 0,
+            **pressure_trace_fields(decision_snapshot, "decision_"),
+            **pressure_trace_fields(execution_snapshot, "execution_"),
+        )
+    context.hooks.trace_event(
+        state,
+        "maintenance.sleep_request_accepted",
+        status="ok",
+        mode=(decision or {}).get("mode") or "mandatory",
+        request_index=(decision or {}).get("request_index") or (latch or {}).get("request_index") or 0,
+        **pressure_trace_fields(decision_snapshot),
+    )
+    state["_maintenance_control_action"] = {"action": "sleep", "wake_prompt": wake_prompt}
+    return context.hooks.json_dumps({"status": "sleep_requested", "wake_prompt_chars": len(wake_prompt)})
+
+
+def _run_retry_ltm_maintenance(_tool_request, context):
+    from runtime.maintenance_sleep import continuation
+    current = continuation(context.runtime_state)
+    if not current or current.get("status") not in {"failed", "handed_off"}:
+        raise RuntimeError("There is no failed maintenance continuation to retry.")
+    context.runtime_state["_maintenance_control_action"] = {"action": "retry"}
+    return context.hooks.json_dumps({"status": "retry_requested", "failure_count": current.get("failure_count", 0), "run_id": current.get("run_id")})
+
+
+def _run_return_maintenance_failure(tool_request, context):
+    from runtime.maintenance_sleep import continuation
+    current = continuation(context.runtime_state)
+    if not current or current.get("status") not in {"failed", "handed_off"}:
+        raise RuntimeError("There is no failed maintenance continuation to return.")
+    message = str((tool_request.get("args") or {}).get("message") or "").strip()
+    if not message:
+        raise RuntimeError("message is required.")
+    context.runtime_state["_maintenance_control_action"] = {"action": "handoff", "message": message}
+    return context.hooks.json_dumps({"status": "returned_to_user"})
+
+
 def _run_replace_block(tool_request, context):
     args = tool_request["args"]
     old_block = tool_request.get("old_block")
@@ -374,6 +457,9 @@ TOOL_EXECUTORS = {
     "get_object": _run_get_object,
     "retrieve_memory": _run_retrieve_memory,
     "memorize": _run_memorize,
+    "sleep_for_maintenance": _run_sleep_for_maintenance,
+    "retry_ltm_maintenance": _run_retry_ltm_maintenance,
+    "return_maintenance_failure": _run_return_maintenance_failure,
 
     "apply_patch": _run_apply_patch,
 }

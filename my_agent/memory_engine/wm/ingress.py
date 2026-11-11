@@ -65,7 +65,7 @@ def stage_wm_ingress_watermark(runtime_state, slot_seq):
 
 
 def stage_wm_ingress_from_projection(runtime_state, projection):
-    omitted = projection.get("omitted_blocks") or []
+    omitted = projection.get("omitted_units") or []
     if not omitted:
         return effective_wm_ingress_watermark(runtime_state)
     max_end = max(int(block.get("end_index", NO_WATERMARK)) for block in omitted)
@@ -74,41 +74,82 @@ def stage_wm_ingress_from_projection(runtime_state, projection):
 
 def current_stm_budget(messages=None, runtime_state=None):
     """Return the effective STM budget for the current provider-context step."""
+    current_messages = messages or event_stream.load_messages()
     pressure = (runtime_state or {}).get("context_pressure") if isinstance(runtime_state, dict) else None
     budgets = pressure.get("budgets") if isinstance(pressure, dict) else None
     try:
         budget = int((budgets or {}).get("stm") or 0)
     except (TypeError, ValueError):
         budget = 0
-    if budget > 0:
-        return budget
+    if budget <= 0:
+        from ..dynamic_context_budget import compute_and_store_dynamic_context_budget
 
-    from ..dynamic_context_budget import compute_and_store_dynamic_context_budget
+        pressure = compute_and_store_dynamic_context_budget(
+            current_messages,
+            runtime_state,
+            emit_observer=False,
+            stabilize=False,
+            apply_stabilizer=False,
+        )
+        budgets = pressure.get("budgets") or {}
+        budget = int(budgets.get("stm") or 10000)
 
-    pressure = compute_and_store_dynamic_context_budget(
-        messages or event_stream.load_messages(),
-        runtime_state,
-        emit_observer=False,
-        stabilize=False,
+    from ..capacity_planner import CapacityLimitError
+    from ..context_budget_override import effective_budget_ranges
+    from ..dynamic_context_budget import STM_MAX_TOKENS, STM_MIN_TOKENS, WM_MAX_TOKENS, WM_MIN_TOKENS
+    from ..stm_projection import latest_eligible_unit_tokens
+
+    ranges = effective_budget_ranges(
+        {
+            "stm_min": STM_MIN_TOKENS,
+            "stm_max": STM_MAX_TOKENS,
+            "wm_min": WM_MIN_TOKENS,
+            "wm_max": WM_MAX_TOKENS,
+        },
+        create=False,
     )
-    return int((pressure.get("budgets") or {}).get("stm") or 10000)
+    required = latest_eligible_unit_tokens(
+        current_messages,
+        effective_wm_ingress_watermark(runtime_state),
+    )
+    maximum = int(ranges["stm_max"])
+    if required > maximum:
+        raise CapacityLimitError("stm", required, maximum, "reject_current_input")
+    return max(budget, required)
 
 
 def stage_wm_ingress_from_messages(messages, runtime_state=None):
     """Stage omissions introduced after the final assistant message was appended."""
-    from ..stm_projection import build_stm_projection
+    from ..capacity_planner import CapacityLimitError
+    from ..context_budget_override import effective_budget_ranges
+    from ..dynamic_context_budget import STM_MAX_TOKENS, STM_MIN_TOKENS, WM_MAX_TOKENS, WM_MIN_TOKENS
+    from ..stm_projection import build_stm_projection, latest_eligible_unit_tokens
 
-    budget = current_stm_budget(messages, runtime_state)
+    current_messages = messages or event_stream.load_messages()
+    watermark = effective_wm_ingress_watermark(runtime_state)
+    ranges = effective_budget_ranges(
+        {
+            "stm_min": STM_MIN_TOKENS,
+            "stm_max": STM_MAX_TOKENS,
+            "wm_min": WM_MIN_TOKENS,
+            "wm_max": WM_MAX_TOKENS,
+        },
+        create=False,
+    )
+    required = latest_eligible_unit_tokens(current_messages, watermark)
+    if required > int(ranges["stm_max"]):
+        raise CapacityLimitError("stm", required, int(ranges["stm_max"]), "model_output_guard_deferred")
+    budget = max(current_stm_budget(current_messages, runtime_state), required)
     projection = build_stm_projection(
-        messages or event_stream.load_messages(),
+        current_messages,
         budget=budget,
-        wm_ingress_watermark=effective_wm_ingress_watermark(runtime_state),
+        wm_ingress_watermark=watermark,
     )
     staged = stage_wm_ingress_from_projection(runtime_state, projection)
     return {
         "staged_watermark": staged,
         "stm_budget": budget,
-        "omitted_block_count": len(projection.get("omitted_blocks") or []),
+        "omitted_unit_count": len(projection.get("omitted_units") or []),
     }
 
 

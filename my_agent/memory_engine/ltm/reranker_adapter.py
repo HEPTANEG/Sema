@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
@@ -80,7 +81,7 @@ class RerankerAdapter:
         except Exception as error:
             queue.put(error)
 
-    def _ensure_started(self):
+    def _ensure_started(self, timeout_seconds=None):
         with self._lock:
             if self._process is not None and self._process.poll() is None and self._base_url:
                 return
@@ -88,6 +89,7 @@ class RerankerAdapter:
             environment["HF_HUB_OFFLINE"] = "1"
             _prepend_python_path(environment)
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            startup_timeout = self.startup_timeout if timeout_seconds is None else max(0.1, min(self.startup_timeout, float(timeout_seconds)))
             self._process = subprocess.Popen(
                 [
                     str(self.python_path),
@@ -110,7 +112,7 @@ class RerankerAdapter:
             ready_queue = Queue(maxsize=1)
             threading.Thread(target=self._read_ready_line, args=(self._process.stdout, ready_queue), daemon=True).start()
             try:
-                line = ready_queue.get(timeout=self.startup_timeout)
+                line = ready_queue.get(timeout=startup_timeout)
             except Empty as error:
                 self.close()
                 raise RerankerServiceError("Reranker Service did not become ready in time.") from error
@@ -126,12 +128,12 @@ class RerankerAdapter:
                 self.close()
                 raise RerankerServiceError("Reranker Service returned an invalid readiness message.") from error
             self._base_url = f"http://127.0.0.1:{port}"
-            health = self._request_json("GET", "/health")
+            health = self._request_json("GET", "/health", timeout_seconds=startup_timeout)
             if health.get("status") != "ready" or health.get("model") != MODEL_NAME or health.get("max_context_tokens") != MAX_CONTEXT_TOKENS:
                 self.close()
                 raise RerankerServiceError("Reranker Service health check failed.")
 
-    def _request_json(self, method, path, payload=None):
+    def _request_json(self, method, path, payload=None, timeout_seconds=None):
         data = None
         headers = {}
         if payload is not None:
@@ -139,7 +141,7 @@ class RerankerAdapter:
             headers["Content-Type"] = "application/json"
         request = Request(f"{self._base_url}{path}", data=data, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=self.request_timeout) as response:
+            with urlopen(request, timeout=timeout_seconds or self.request_timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             try:
@@ -150,13 +152,14 @@ class RerankerAdapter:
         except (URLError, OSError, json.JSONDecodeError) as error:
             raise RerankerServiceError(f"Reranker Service request failed: {error}") from error
 
-    def rerank(self, query, candidates, _diagnostic_profiler=None):
+    def rerank(self, query, candidates, _diagnostic_profiler=None, timeout_seconds=None):
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string.")
         if not isinstance(candidates, (list, tuple)) or not candidates:
             raise ValueError("candidates must be a non-empty sequence.")
         payload = {"query": query, "candidates": list(candidates)}
         with self._lock:
+            deadline = None if timeout_seconds is None else time.monotonic() + float(timeout_seconds)
             process = self._process
             process_running = process is not None and (
                 not hasattr(process, "poll") or process.poll() is None
@@ -166,13 +169,23 @@ class RerankerAdapter:
                 if not was_started:
                     _diagnostic_profiler.mark_cold_start("reranker")
                 with _diagnostic_profiler.measure("reranker_service_startup_ms"):
-                    self._ensure_started()
+                    if deadline is None:
+                        self._ensure_started()
+                    else:
+                        self._ensure_started(timeout_seconds=max(0.1, deadline - time.monotonic()))
                 _diagnostic_profiler.increment("reranker_request_count")
                 with _diagnostic_profiler.measure("reranker_request_ms"):
-                    result = self._request_json("POST", "/rerank", payload)
+                    if deadline is None:
+                        result = self._request_json("POST", "/rerank", payload)
+                    else:
+                        result = self._request_json("POST", "/rerank", payload, timeout_seconds=max(0.1, deadline - time.monotonic()))
             else:
-                self._ensure_started()
-                result = self._request_json("POST", "/rerank", payload)
+                if deadline is None:
+                    self._ensure_started()
+                    result = self._request_json("POST", "/rerank", payload)
+                else:
+                    self._ensure_started(timeout_seconds=max(0.1, deadline - time.monotonic()))
+                    result = self._request_json("POST", "/rerank", payload, timeout_seconds=max(0.1, deadline - time.monotonic()))
         if result.get("model") != MODEL_NAME or not isinstance(result.get("scores"), list):
             raise RerankerServiceError("Reranker Service returned incompatible metadata.")
         if len(result["scores"]) != len(candidates):
@@ -212,7 +225,7 @@ def _get_default_adapter():
         return _default_adapter
 
 
-def rank_2_candidates(stm_messages, candidates, *, max_items=80, _diagnostic_profiler=None):
+def rank_2_candidates(stm_messages, candidates, *, max_items=80, timeout_seconds=None, _diagnostic_profiler=None):
     from .memory_push_ranking import build_rank_2_query, prepare_rank_2_candidates
     from .memory_push_ranking import RANK_2_QUERY_MAX_TOKENS
 
@@ -227,9 +240,15 @@ def rank_2_candidates(stm_messages, candidates, *, max_items=80, _diagnostic_pro
     )
     adapter = _get_default_adapter()
     if _diagnostic_profiler is None:
-        batch = adapter.rerank(query, prepared)
+        if timeout_seconds is None:
+            batch = adapter.rerank(query, prepared)
+        else:
+            batch = adapter.rerank(query, prepared, timeout_seconds=timeout_seconds)
     else:
-        batch = adapter.rerank(query, prepared, _diagnostic_profiler=_diagnostic_profiler)
+        if timeout_seconds is None:
+            batch = adapter.rerank(query, prepared, _diagnostic_profiler=_diagnostic_profiler)
+        else:
+            batch = adapter.rerank(query, prepared, _diagnostic_profiler=_diagnostic_profiler, timeout_seconds=timeout_seconds)
     by_id = {item["object_id"]: item for item in batch.scores}
     items = []
     for candidate in prepared:

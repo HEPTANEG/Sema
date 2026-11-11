@@ -355,7 +355,7 @@ def schedule_event_stream_memory_maintenance(messages, runtime_state=None, depen
             post_answer_stage = {
                 "staged_watermark": -1,
                 "stm_budget": 0,
-                "omitted_block_count": 0,
+                "omitted_unit_count": 0,
                 "error": str(error),
             }
         try:
@@ -373,7 +373,7 @@ def schedule_event_stream_memory_maintenance(messages, runtime_state=None, depen
             persisted_watermark=watermark_result.get("persisted_watermark", -1),
             staged_watermark=watermark_result.get("staged_watermark", -1),
             effective_watermark=watermark_result.get("effective_watermark", -1),
-            post_answer_omitted_block_count=post_answer_stage.get("omitted_block_count", 0),
+            post_answer_omitted_unit_count=post_answer_stage.get("omitted_unit_count", 0),
             stm_budget=post_answer_stage.get("stm_budget", 0),
             error=post_answer_stage.get("error") or watermark_result.get("error") or "",
         )
@@ -386,7 +386,7 @@ def schedule_event_stream_memory_maintenance(messages, runtime_state=None, depen
                 persisted_watermark=watermark_result.get("persisted_watermark", -1),
                 staged_watermark=watermark_result.get("staged_watermark", -1),
                 effective_watermark=watermark_result.get("effective_watermark", -1),
-                post_answer_omitted_block_count=post_answer_stage.get("omitted_block_count", 0),
+                post_answer_omitted_unit_count=post_answer_stage.get("omitted_unit_count", 0),
                 stm_budget=post_answer_stage.get("stm_budget", 0),
                 error=post_answer_stage.get("error") or watermark_result.get("error") or "",
             )

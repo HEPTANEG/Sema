@@ -8,7 +8,6 @@ DECAY_PER_CONTEXT_BUILD = 0.80
 DEADBAND_RATIO = 0.10
 HIGH_WATERMARK_RATIO = 0.80
 HIGH_WATERMARK_HOLD_STEPS = 3
-FAILURE_HOLD_STEPS = 5
 
 
 def _ensure_table(connection):
@@ -51,23 +50,29 @@ def reset_budget_stabilizer_state():
 
 
 def apply_budget_stabilizer(status, persist=True):
+    return apply_capacity_stabilizer(status, persist=persist)
+
+
+def apply_capacity_stabilizer(status, candidates=None, session_key="", failure_increment=False, persist=True, advance_seq=False):
     status = dict(status or {})
     budgets = dict(status.get("budgets") or {})
+    candidates = dict(candidates or {})
     raw = {
-        "stm": int(budgets.get("stm") or 0),
-        "wm": int(budgets.get("wm") or 0),
+        "stm": int(candidates.get("stm") or budgets.get("stm") or 0),
+        "wm": int(candidates.get("wm") or budgets.get("wm") or 0),
     }
     ranges = {
         "stm": (int(budgets.get("stm_min") or 0), int(budgets.get("stm_max") or 0)),
         "wm": (int(budgets.get("wm_min") or 0), int(budgets.get("wm_max") or 0)),
     }
     state = load_budget_stabilizer_state(create=bool(persist))
-    if persist:
+    session_key = str(session_key or "")
+    if session_key and state.get("failure_session_key") != session_key:
+        state["context_budget_failure_count"] = 0
+        state["failure_session_key"] = session_key
+    if persist or advance_seq:
         state["context_build_seq"] = int(state.get("context_build_seq") or 0) + 1
     seq = int(state.get("context_build_seq") or 0)
-    failure = status.get("failure") or {}
-    target = str(failure.get("target") or "")
-    context_failed = bool(failure.get("context_build_failure"))
     stabilized = {}
     holds = {}
     for name in ("stm", "wm"):
@@ -75,19 +80,17 @@ def apply_budget_stabilizer(status, persist=True):
         previous = state.get(f"{name}_stable_budget")
         hold_until = int(state.get(f"{name}_hold_until_seq") or 0)
         raw_budget = _clamp(raw[name], minimum, maximum)
-        if context_failed and target == name:
-            stable = maximum
-            hold_until = max(hold_until, seq + FAILURE_HOLD_STEPS)
-        else:
-            if maximum > 0 and raw_budget >= int(maximum * HIGH_WATERMARK_RATIO):
-                hold_until = max(hold_until, seq + HIGH_WATERMARK_HOLD_STEPS)
-            stable = _stabilize_one(raw_budget, previous, minimum, maximum, seq, hold_until)
+        if maximum > 0 and raw_budget >= int(maximum * HIGH_WATERMARK_RATIO):
+            hold_until = max(hold_until, seq + HIGH_WATERMARK_HOLD_STEPS)
+        stable = _stabilize_one(raw_budget, previous, minimum, maximum, seq, hold_until)
         stabilized[name] = stable
         holds[name] = hold_until
         state[f"{name}_stable_budget"] = stable
         state[f"{name}_hold_until_seq"] = hold_until
         state[f"last_raw_{name}_budget"] = raw_budget
 
+    if persist and failure_increment:
+        state["context_budget_failure_count"] = int(state.get("context_budget_failure_count") or 0) + 1
     if persist:
         _save_state(state)
 
@@ -106,13 +109,14 @@ def apply_budget_stabilizer(status, persist=True):
         "deadband_ratio": DEADBAND_RATIO,
         "high_watermark_ratio": HIGH_WATERMARK_RATIO,
         "high_watermark_hold_steps": HIGH_WATERMARK_HOLD_STEPS,
-        "failure_hold_steps": FAILURE_HOLD_STEPS,
         "stm_hold_until_seq": holds["stm"],
         "wm_hold_until_seq": holds["wm"],
         "stm_raw_budget": raw["stm"],
         "wm_raw_budget": raw["wm"],
         "stm_stable_budget": stabilized["stm"],
         "wm_stable_budget": stabilized["wm"],
+        "continuous_session_context_budget_failure_count": int(state.get("context_budget_failure_count") or 0),
+        "failure_session_key": state.get("failure_session_key") or "",
     }
     status["budget_source"] = _budget_source(status.get("budget_source"), persist)
     return status
@@ -171,6 +175,8 @@ def _empty_state():
         "wm_hold_until_seq": 0,
         "last_raw_stm_budget": None,
         "last_raw_wm_budget": None,
+        "context_budget_failure_count": 0,
+        "failure_session_key": "",
     }
 
 
@@ -181,6 +187,9 @@ def _normalize_state(data):
     result = dict(empty)
     for key in result:
         value = data.get(key)
+        if key == "failure_session_key":
+            result[key] = str(value or "")
+            continue
         if value is None:
             result[key] = None
             continue
@@ -189,6 +198,14 @@ def _normalize_state(data):
         except (TypeError, ValueError):
             pass
     return result
+
+
+def context_budget_failure_count(session_key=""):
+    state = load_budget_stabilizer_state(create=False)
+    session_key = str(session_key or "")
+    if session_key and state.get("failure_session_key") != session_key:
+        return 0
+    return int(state.get("context_budget_failure_count") or 0)
 
 
 def _clamp(value, minimum, maximum):

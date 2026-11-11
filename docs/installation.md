@@ -112,13 +112,17 @@ model does not opt into this permanent-skip behavior.
 
 Settings are stored in the user-level `~/.sema/config.json` (or `SEMA_HOME`).
 Saved credentials are plain text in this local file, never displayed as values
-by the Settings API. Protect the file and do not commit it. Environment
-variables take precedence over saved fields; Status reports their source.
+by the Settings API. Protect the file and do not commit it. Saved model fields
+take precedence over model-related environment variables; environment
+variables are used when the corresponding field has no saved value. Status
+reports an environment source only when it is the effective source.
 
-Existing overrides remain supported: `SEMA_EMBEDDING_MODEL_PATH`,
+Model-related overrides remain supported as fallbacks. Other service-specific
+environment variables remain effective overrides: `SEMA_EMBEDDING_MODEL_PATH`,
 `SEMA_RERANKER_MODEL_PATH`, `SEMA_RERANKER_PYTHON`, `TAVILY_API_KEY`, and
 `SEMA_TELEGRAM_BOT_TOKEN` / `SEMA_TELEGRAM_USER_ID` / `SEMA_TELEGRAM_CHAT_ID`.
-If an environment override is set, editing the saved value will not override it.
+After saving a field in Settings, restart Sema if the running Backend was
+started with an older effective configuration.
 
 Missing means a required value/path is absent. Not tested means the current
 configuration has no valid recorded test. Failed means the test did not pass.

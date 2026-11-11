@@ -68,6 +68,17 @@ export function resolveSlashCommandInput(commands: SlashCommand[], input: string
   return completion?.name ?? normalized;
 }
 
+export function resolveSemaSlashInput(commands: SlashCommand[], input: string) {
+  const normalized = input.trim();
+  const bestVisibleMatch = matchingSlashCommands(commands, normalized).at(-1);
+  const hasArguments = bestVisibleMatch
+    && normalized.toLowerCase().startsWith(`${bestVisibleMatch.name.toLowerCase()} `);
+  if (hasArguments) {
+    return resolveSlashCommandInput(commands, normalized);
+  }
+  return bestVisibleMatch?.name ?? resolveSlashCommandInput(commands, normalized);
+}
+
 type FuzzyCandidate = {
   command: SlashCommand;
   distance: number;

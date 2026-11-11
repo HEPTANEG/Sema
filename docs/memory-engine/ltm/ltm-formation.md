@@ -102,27 +102,34 @@ target. Runtime anchors every created Episode to its Event Stream range with a
 
 ### Bounded Write-Plan Repair
 
-The Formation prompt states the 1-50 token title limit before generation.
-For `title_length`, `missing_summary`, `unexpected_summary`, and
-`payload_too_large`, Runtime reports the object field path, measured title
+The Formation prompt states the 1-50 token title limit and the Episode
+`structured_data` shape before generation. Episode structured data may be
+`null`, `{}`, or an object containing only a non-empty `time_scope` with
+optional `precision` of `exact`, `approximate`, or `relative`.
+For `title_length`, `missing_summary`, `unexpected_summary`, `payload_too_large`,
+and the supported Episode structured-data errors, Runtime reports the object field path, measured title
 tokens or Payload UTF-8 bytes, and the applicable limits. Byte measurement uses
 the same canonical Payload calculation as Core Store validation.
 
-When all reported validation errors belong to these four categories, Formation
+When all reported validation errors belong to these categories, Formation
 may make at most two correction requests after the initial invalid plan. These
 requests have an independent allowance: earlier retrieval/model rounds do not
 consume the repair opportunities. The original evidence, retrieved results,
 invalid plan, and validation feedback remain in context. Corrections return a
 complete plan with unrelated objects and fields unchanged; Runtime does not
-automatically compress, truncate, or remove content.
+automatically compress, truncate, or remove content. For Episode structured-data
+repair, Runtime also requires the same object count and order and accepts
+changes only to the marked object's `payload.structured_data`; other field,
+object, and link changes are rejected.
 
 Retrieval tools are omitted from repair requests, and tool calls returned during
 repair are rejected without execution. Each corrected plan undergoes complete
 validation. A valid `no_memory` remains an accepted model decision. Exhausted
-repairs, malformed responses, or errors outside these four categories follow
+repairs, malformed responses, or errors outside these categories follow
 the existing WorkItem failure/retry path. Mixed repairable/nonrepairable errors
-do not enter this repair flow. No partial plan is committed, and other WorkItems
-retain their independent outcomes.
+do not enter this repair flow. Formation never partially commits a plan after
+its repair allowance is exhausted, and other WorkItems retain their independent
+outcomes.
 
 Existing diagnostics distinguish validation errors, correction attempts, and
 terminal outcomes. A recovered validation error is not a failed WorkItem.

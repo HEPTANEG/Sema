@@ -36,6 +36,21 @@ def test_external_id_resumes_the_same_trajectory(isolated_workspace):
     assert trajectory.get_trajectory(first["trajectory_id"])["trajectory"]["status"] == "running"
 
 
+def test_external_id_can_be_marked_failed_before_new_owner_starts(isolated_workspace):
+    first = trajectory.start_trajectory("ltm_maintainer", "run-stale")
+
+    assert trajectory.fail_trajectory_by_external_id(
+        "ltm_maintainer",
+        "run-stale",
+        RuntimeError("owner exited"),
+        metadata={"reason": "stale owner"},
+    )
+
+    stored = trajectory.get_trajectory(first["trajectory_id"])
+    assert stored["trajectory"]["status"] == "failed"
+    assert "owner exited" in stored["trajectory"]["error_message"]
+
+
 def test_content_addressed_artifacts_are_reused(isolated_workspace):
     context = trajectory.start_trajectory("main_agent")
     first = trajectory.record_event(context, "one", artifacts={"body": "same"})

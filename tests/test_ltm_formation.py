@@ -95,6 +95,7 @@ def test_formation_prompt_includes_core_store_payload_size_contract():
     assert "system_root_tags" in prompt
     assert "outgoing_links" in prompt
     assert "Others is only a fallback" in prompt
+    assert "Episode `structured_data` must be `null`, `{}`" in prompt
 
 
 def test_formation_projection_contains_only_minimal_system_root_metadata():
@@ -705,6 +706,31 @@ def test_formation_repairs_title_length_before_commit(isolated_workspace, monkey
     assert result["validation_error_codes"] == {"title_length": 1}
     assert result["validation_error_paths"] == {"objects[0].title": 1}
     assert ltm_store.list_objects("assertion")[0]["title"] == "Concise durable memory title"
+
+
+def test_formation_repairs_episode_structured_data_without_changing_other_fields(isolated_workspace, monkeypatch):
+    from memory_engine import event_stream
+    from memory_engine.ltm import formation, ltm_store
+
+    event_stream.save_messages(_messages())
+    _prepare_segment()
+    monkeypatch.setattr(formation, "_buffer_slots", lambda _messages, _runtime_state=None: ({0, 1, 2, 3}, 100))
+    invalid = _object_draft("Bounded research episode", object_type="episode")
+    invalid["payload"]["structured_data"] = {"time_scope": {}}
+    repaired = _object_draft("Bounded research episode", object_type="episode")
+    repaired["payload"]["structured_data"] = {"time_scope": {"start": "2026-11-01", "precision": "approximate"}}
+    runtime_state = {"eval_formation_responses": [
+        {"content": "", "tool_calls": [_tool_call("ltm_select_objects", {"projection": "title"})]},
+        {"content": json.dumps({"action": "write_plan", "objects": [invalid]})},
+        {"content": json.dumps({"action": "write_plan", "objects": [repaired]})},
+    ]}
+
+    result = formation.run_formation_maintenance(_messages(), runtime_state=runtime_state)
+
+    assert result["completed_count"] == 1
+    assert result["failed_count"] == 0
+    assert result["validation_error_codes"] == {"empty_time_scope": 1}
+    assert ltm_store.list_objects("episode", include_payload=True)[0]["payload"]["structured_data"] == {"time_scope": {"start": "2026-11-01", "precision": "approximate"}}
 
 
 def test_invalid_tag_plan_is_atomic_and_work_item_can_retry(isolated_workspace, monkeypatch):

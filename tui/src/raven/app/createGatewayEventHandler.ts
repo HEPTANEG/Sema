@@ -268,11 +268,23 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
 
       case 'wake_delivered':
-        if (ev.payload?.source === 'maintainer' && ev.payload?.kind === 'maintenance_completed') {
-
-
+        if (
+          ev.payload?.source === 'maintainer'
+          && (
+            ev.payload?.kind === 'maintenance_completed'
+            || ev.payload?.kind === 'maintenance_task_resumed'
+            || ev.payload?.kind === 'maintenance_sleep_failed'
+          )
+        ) {
           closeLtmMaintenanceView()
-          patchUiState({ busy: true, status: 'waking from LTM maintenance…' })
+          patchUiState({
+            busy: true,
+            status: ev.payload.kind === 'maintenance_task_resumed'
+              ? 'resuming task after LTM maintenance…'
+              : ev.payload.kind === 'maintenance_sleep_failed'
+                ? 'handling LTM maintenance failure…'
+                : 'waking from LTM maintenance…'
+          })
         }
         return
 

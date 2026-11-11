@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
 
 from . import ltm_store
@@ -663,7 +664,7 @@ def semantic_search(query, *, profile, root=None, _diagnostic_profiler=None):
         return _error_result(error)
 
 
-def semantic_search_many(queries, *, profile, root=None, _diagnostic_profiler=None):
+def semantic_search_many(queries, *, profile, root=None, _diagnostic_profiler=None, deadline=None):
     """Search multiple semantic queries with one batched embedding request."""
     try:
         _validate_operation(profile, "semantic_search")
@@ -678,11 +679,27 @@ def semantic_search_many(queries, *, profile, root=None, _diagnostic_profiler=No
         from .embedding_adapter import embed_queries
         from .vector_index import VectorIndexAdapter
 
+        timeout_seconds = None
+        if deadline is not None:
+            remaining = float(deadline) - time.monotonic()
+            if remaining <= 0:
+                raise QueryError("deadline_exceeded", "queries", "Memory Push exceeded its foreground time budget.")
+            timeout_seconds = max(1, int(remaining))
         if _diagnostic_profiler is not None:
             _diagnostic_profiler.increment("semantic_query_count", len(normalized))
-            batch = embed_queries(normalized, _diagnostic_profiler=_diagnostic_profiler)
+            if timeout_seconds is None:
+                batch = embed_queries(normalized, _diagnostic_profiler=_diagnostic_profiler)
+            else:
+                batch = embed_queries(
+                    normalized,
+                    _diagnostic_profiler=_diagnostic_profiler,
+                    timeout_seconds=timeout_seconds,
+                )
         else:
-            batch = embed_queries(normalized)
+            if timeout_seconds is None:
+                batch = embed_queries(normalized)
+            else:
+                batch = embed_queries(normalized, timeout_seconds=timeout_seconds)
         if len(batch.vectors) != len(normalized):
             raise QueryError("embedding_failed", "queries", "Embedding Adapter returned an unexpected vector count.")
 

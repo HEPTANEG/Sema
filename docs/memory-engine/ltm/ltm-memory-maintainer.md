@@ -35,6 +35,11 @@ An explicit `continuation_id` submitted later starts a new delegation and a new
 deadline. A deadline result is technical and incomplete, not an empty search result
 or a maintenance decision.
 
+Each Maintainer provider response has a 120-second total response deadline. The
+deadline covers response-body consumption as well as connection setup, so a
+provider that keeps a response open cannot leave the maintenance run waiting
+indefinitely.
+
 Prompt step 3 is global duplicate review and consolidation, not optional broad
 review. Check older memories by topic as well as new-memory neighborhoods, preserve
 independent context, and merge only when justified. There is no exhaustive scan,
@@ -144,11 +149,13 @@ evidence. Runtime does not require a Store modification or a fixed number of
 changes. With no new slots, only the amount of `recent_review` work is reduced;
 the other semantic stages still run.
 
-Each semantic stage must provide a `stage_summary` of no more than 500 tokens.
-This is a hard Runtime contract stated in the Maintainer prompt. If a complete
-summary is over the limit, Runtime gives tiered rewrite feedback and, after the
-applicable retries, accepts a tokenizer-truncated summary when the stage report
-is otherwise valid. This auxiliary recovery does not make maintenance fail.
+Each semantic stage should provide a `stage_summary` of no more than 500 tokens,
+which is the normal target stated in the Maintainer prompt. Runtime tolerates
+occasional summaries up to 1,000 tokens without warning or rewriting. Above 1,000,
+Runtime gives tiered rewrite feedback and, after the applicable retries, accepts
+a tokenizer-truncated summary at the 1,000-token runtime limit when the stage
+report is otherwise valid. This auxiliary recovery does not make maintenance
+fail.
 
 Root tags are protected system anchors. Modifying their structure is
 prohibited.
@@ -163,7 +170,7 @@ maintainable_frontier = newest slot in the current Formation Buffer
 coverage_target = max(maintenance_coverage_cursor, maintainable_frontier)
 unmaintained_maintainable_slot_count =
     max(0, maintainable_frontier - maintenance_coverage_cursor)
-maintenance_pressure = min(1.0, unmaintained_maintainable_slot_count / 100)
+maintenance_pressure = min(1.0, unmaintained_maintainable_slot_count / 200)
 ```
 
 The initial cursor is `-1`, so first maintenance starts at the first eligible
@@ -187,24 +194,32 @@ Pressure levels:
 | pressure          | level   | behavior                                                                                                                                                                                                    |
 | ----------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `< 0.5`           | none    | no Main Agent notice                                                                                                                                                                                        |
-| `0.5 <= p < 0.75` | mild    | one internal-state signal explains that unorganized memories are making the Main Agent sleepy and suggests maintenance when the current task naturally ends                                                 |
-| `0.75 <= p < 0.9` | strong  | the stronger uppercase signal is repeated three times and requires wrapping up, avoiding large new work, and explicitly requesting maintenance                                                              |
-| `0.9 <= p < 1.0`  | urgent  | the urgent uppercase signal is repeated ten times; it states that the disorganized maintenance backlog is interfering with reliable memory use and tells the Main Agent not to start or expand another task |
-| `>= 1.0`          | blocked | an ordinary TUI user message starts automatic LTM Maintenance before a Main-Agent turn; the pending message is retained for later resubmission |
+| `0.5 <= p < 0.75` | mild    | one internal notice; `sleep_for_maintenance` becomes available for a safe voluntary pause |
+| `0.75 <= p < 0.9` | strong  | a stronger notice recommends arranging a pause soon |
+| `0.9 <= p < 1.0`  | urgent  | an urgent notice recommends pausing at the next safe point |
+| `>= 1.0`          | blocked | at the next model decision boundary only `sleep_for_maintenance` is accepted |
 
-At `pressure >= 1.0`, the TUI automatically starts LTM Maintenance instead of
-starting an ordinary Main-Agent turn. The triggering user message remains
-pending in the TUI and is not appended or submitted before maintenance; after
-maintenance and its completion Wake, the user can submit it again. A second
-message does not start a parallel maintenance run. Non-TUI callers receive the
-pressure-gate error, while `/memory ltm maintain` and other permitted
-slash/status/debug commands remain available.
+At `pressure >= 1.0`, the user message enters the Main-Agent context first.
+Runtime does not interrupt an in-flight response or its returned tool batch;
+at the next model decision boundary, ordinary tools and final answers are
+rejected until the Main Agent calls `sleep_for_maintenance` alone with a
+`wake_prompt`. The `1.0` decision is latched in process memory, so a later
+frontier retreat cannot reopen ordinary tools before Bridge accepts the sleep
+request and establishes the maintenance continuation. Successful maintenance
+resumes the task through a dedicated Wake. During that resumed task, another
+sleep request is allowed once the continuation is in `resuming`; it keeps the
+same continuation ID and starts a new maintenance run. `running` and
+`sleep_requested` remain non-reentrant. A failed run wakes Main Agent with
+its failure count and allows only a same-run retry or a user-facing handoff;
+ordinary task work remains paused. The latch and continuation are process-local
+and are not recovered after restart. Manual `/memory ltm maintain` keeps its
+existing behavior.
 
-Soft pressure notices describe the Main Agent's own internal memory state and
-explain that `/memory ltm maintain` pauses normal conversation so Maintainer can
-organize, update, and consolidate recent memories. Repetition acts as a
-deterministic salience multiplier as pressure rises. These notices are runtime
-system context only; they do not enter Event Stream, LTM, or session messages.
+Soft pressure notices describe the Main Agent's internal memory state and
+explain the task-pause tool. Each provider request uses one decision snapshot
+for the notice, offered tools, boundary checks, and tool authorization. Notices
+are rebuilt rather than accumulated as historical messages. They do not enter
+Event Stream or LTM as separate records.
 
 Maintainer's source-range check is a Runtime policy, not a global Store
 validator change. A `sourced_from` link whose Event Stream range ends after
@@ -277,10 +292,23 @@ tagged_with -> create a tag and link each source object to that tag
 supports     -> create an assertion and link each assertion or episode source to it
 ```
 
+For `supports`, every source must be an assertion or episode; a Tag cannot
+support an assertion. The new object must be an assertion. To create an
+Episode from Event Stream evidence, use atomic `create_object` with
+`object_type: episode` and `create_link` with `relation_type: sourced_from` to
+the relevant slot or range. `abstract` cannot create Episodes.
+
 Object provenance is a separate operation. A new object sourced from Event
 Stream evidence uses a `sourced_from` Link whose target is an Event Stream slot
 or contiguous range. The Store rejects `sourced_from` links targeting another
 MemoryObject and rejects any other abstract relation.
+
+Links created through `create_link` or `relink` use the following endpoint
+contract: `sourced_from` is MemoryObject -> Event Stream slot; `tagged_with` is
+MemoryObject -> tag; `supports` and `contradicts` are assertion or episode ->
+assertion; and `supersedes` is MemoryObject -> MemoryObject. The tool schema
+describes this contract, while Runtime resolves and validates existing IDs and
+same-plan temporary IDs.
 
 Supported explicit atomic operations:
 
@@ -299,6 +327,11 @@ The model-visible schema is strict:
 - `create_object` is an atomic operation, not an intent;
 - major schema levels reject unknown fields.
 
+Episode `payload.structured_data` is constrained in the same schema: it may be
+`null`, `{}`, or an object whose only field is `time_scope`. A non-empty
+`time_scope` must contain `start`, `end`, or `anchor`, and optional `precision`
+must be `exact`, `approximate`, or `relative`.
+
 The Compiler deterministically validates schema shape, resolves plan-local
 `temp_id` references, allocates real object IDs, expands intents, deduplicates
 identical operations, rejects conflicting updates, verifies references, and
@@ -313,8 +346,41 @@ modify strength, update cursor, write SQLite, or repair indexes.
 
 Store commits the whole compiled plan atomically. Any validator, embedding,
 Vector, or index failure rejects the entire plan. Infrastructure write failures
-fail the maintenance run. Five consecutive rejected `submit_maintenance_plan`
-calls also fail the run with a clear failure reason.
+fail the maintenance run. New-object titles are short index labels and must
+contain 1-50 Runtime-counted tokens; detailed facts belong in the payload. A
+title-length rejection includes its field path, actual token count, and limit.
+Payload size is the UTF-8 byte size of `body` plus canonical JSON for
+`structured_data`: at or below 2048 bytes `summary` must be empty, above 2048
+and at or below 8192 bytes it is required, and above 8192 bytes the payload
+must be split. Payload validation errors report the measured size and limits.
+If all reported errors are unnecessary summaries on small new-object payloads,
+Runtime clears only those summaries and revalidates the whole compiled Plan.
+The normalized fields and measured sizes are recorded in trajectory diagnostics.
+
+Independent modification groups should be submitted as separate Plans. Objects,
+Links, and intents that must remain atomic stay together; Runtime does not
+automatically split a large Plan or impose a fixed object-count limit.
+
+For a supported title-length, summary, or Episode structured-data rejection, Runtime
+saves the rejected plan as an invocation-local draft and exposes
+`repair_maintenance_plan`. The tool accepts `repairs` containing only
+Runtime-marked `{target, field, value}` entries. The supported fields are
+`title`, `summary`, and `payload.structured_data`; payloads outside those
+fields, object types, links, intents, and temp IDs cannot be changed through
+it. Runtime then recompiles and validates the complete plan. Titles, summaries,
+and structured data are not automatically truncated, guessed, or split.
+
+If the repaired submission still has a small number of supported title-length,
+summary, or Episode structured-data errors,
+Runtime may partially commit independent complete units: an invalid object and
+its dependent links are skipped, while unrelated valid objects, links, and
+intents are committed atomically. The response identifies committed and
+skipped groups and preserves the skipped draft for later repair. Partial
+commit is limited to title, summary, and Episode structured-data error
+families; malformed JSON, top-level schema errors, dependency ambiguity,
+idempotency conflicts, payloads over 8192 bytes, and all other errors retain
+the existing whole-plan rejection behavior. Five consecutive rejected plan attempts still
+fail the run when no safe progress is made.
 
 ## Semantic Stop And Final Check
 
@@ -438,9 +504,12 @@ semantic_digest_token_count
 
 ## Staged Summaries And Completion Wake
 
-Each semantic stage reports a semantic `stage_summary` of at most 500 tokens.
-Runtime mechanically joins the four summaries into `maintenance_summary` with
-stage boundaries. It does not ask a fifth model call to rewrite the result.
+Each semantic stage targets a semantic `stage_summary` of at most 500 tokens.
+Runtime accepts up to 1,000 tokens as a bounded tolerance and mechanically joins
+the four summaries into `maintenance_summary` with stage boundaries. It does
+not ask a fifth model call to rewrite the result. The theoretical maximum of
+the four-stage summary is therefore about 4000 tokens, although the Prompt
+continues to target 500 tokens per stage.
 Summaries contain useful memory topics, facts, changes, clues, and IDs where
 needed, rather than a diary of Maintainer actions.
 
@@ -467,23 +536,19 @@ objects. Each distinct term counts once across all fields. Results expose
 then strength descending, creation time descending, and object ID. Filters and
 ranking precede the existing projection limits. Other Agents are unchanged.
 
-Within each invocation, Runner signs ordered observation calls, parsed arguments,
-and complete results after appending tool results to context. Call IDs, object
-key order, and assistant narration are excluded; array and call order remain.
-Only rounds containing exclusively the five observation tools qualify, including
-unchanged empty, nonempty, and structured error results. Changed observations
-restart at one; non-observation actions, invalid arguments, and Semantic Stop
-reset the streak. The third identical round adds one neutral Runtime reflection
-notice to model context and the dedicated Maintainer view. The fifth fails via
-`repeated_observation_no_progress`, without another model request or rollback of
-committed plans, coverage, or checkpoints. Manual resume uses the same run ID
-with a fresh counter. Alternating cycles and global budgets remain out of scope.
+The staged Runner uses the shared [Context Repetition Detection](../../context-repetition-detection.md)
+module. It compares accepted assistant output and tool calls, not Tool results,
+with exact and lightweight near-duplicate fingerprints. A ten-output sliding
+window emits warnings at three, five, and eight consecutive similar outputs.
+Warnings do not fail or stop maintenance; the current Maintainer decides
+whether repeated inspection is necessary. Stage boundaries cannot be combined
+into one repetition cluster, and a new invocation or resume starts a new
+detector. The legacy Maintainer path is documented and handled separately.
 
-Trajectory events `maintainer.observation_repetition_warning` and
-`maintainer.observation_repetition_stopped` reference the signature, repetition
-count, model rounds, and tool spans, reusing their existing artifacts. The UI
-event `ltm_maintenance_repetition_warning` stays outside ordinary chat and Event
-Stream; terminal failure uses the existing busy-release lifecycle.
+Trajectory records each threshold immediately with compact fingerprints,
+matched rounds, model and stage metadata, tool spans, and artifact references.
+The existing `ltm_maintenance_repetition_warning` event remains outside
+ordinary chat and Event Stream. Diagnostic persistence is fail-open.
 
 ## Deferred Work
 

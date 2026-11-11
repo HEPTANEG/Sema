@@ -552,6 +552,21 @@ def fail_trajectory(context, error, metadata=None):
         return None
 
 
+def fail_trajectory_by_external_id(process_type, external_id, error, metadata=None, root=None):
+    try:
+        with _connect(root) as connection:
+            row = connection.execute(
+                "SELECT trajectory_id, status FROM trajectories WHERE process_type = ? AND external_id = ?",
+                (str(process_type), str(external_id)),
+            ).fetchone()
+        if row is None or row["status"] != "running":
+            return False
+        context = _context(row["trajectory_id"], root=root)
+        return bool(fail_trajectory(context, error, metadata=metadata))
+    except Exception:
+        return False
+
+
 def _enforce_retention(root=None):
     with _LOCK, _connect(root) as connection:
         process_types = [row[0] for row in connection.execute("SELECT DISTINCT process_type FROM trajectories")]

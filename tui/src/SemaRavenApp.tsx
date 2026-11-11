@@ -36,6 +36,7 @@ import {
 } from './raven/app/ltmMaintenanceStore.js'
 import {
   failLtmMaintenanceFromSlashError,
+  failLtmMaintenanceFromBackendDisconnect,
   handleLtmMaintenanceEvent,
   isLtmMaintainCommand,
   settleLtmMaintenanceFromSlashResult
@@ -43,7 +44,8 @@ import {
 import { BridgeClient } from './protocol/client.js'
 import type { BridgeEvent, ConfirmationRequest, ContextPressureTelemetry, EditStats, InitializeResult, SlashCommand } from './protocol/types.js'
 import type { GatewayEvent } from './raven/gatewayTypes.js'
-import { matchingSlashCommands, resolveSlashCommandInput } from './commands/slash.js'
+import { matchingSlashCommands, resolveSemaSlashInput } from './commands/slash.js'
+export { resolveSemaSlashInput } from './commands/slash.js'
 import { getInputSelection } from './raven/app/inputSelectionStore.js'
 import { writeClipboardText } from './raven/lib/clipboard.js'
 import {
@@ -104,11 +106,6 @@ export function semaSlashCompletions(commands: SlashCommand[], input: string, li
     meta: command.help,
     text: command.name
   }))
-}
-
-export function resolveSemaSlashInput(commands: SlashCommand[], input: string) {
-  const bestVisibleMatch = semaSlashCompletions(commands, input).at(-1)
-  return bestVisibleMatch?.text ?? resolveSlashCommandInput(commands, input)
 }
 
 function closeCommandOutput() {
@@ -234,11 +231,23 @@ function useRavenTranscript(
           patchUiState({busy: true, status: '', focusShiftNotice: null})
           break
         case 'wake_delivered':
-          if (payload.source === 'maintainer' && payload.kind === 'maintenance_completed') {
-
-
+          if (
+            payload.source === 'maintainer'
+            && (
+              payload.kind === 'maintenance_completed'
+              || payload.kind === 'maintenance_task_resumed'
+              || payload.kind === 'maintenance_sleep_failed'
+            )
+          ) {
             closeLtmMaintenanceView()
-            patchUiState({busy: true, status: 'waking from LTM maintenance…'})
+            patchUiState({
+              busy: true,
+              status: payload.kind === 'maintenance_task_resumed'
+                ? 'resuming task after LTM maintenance…'
+                : payload.kind === 'maintenance_sleep_failed'
+                  ? 'handling LTM maintenance failure…'
+                  : 'waking from LTM maintenance…'
+            })
           }
           break
         case 'context_pressure':
@@ -500,7 +509,9 @@ export function SemaRavenApp() {
       applyNotificationSettings(result.notifications || {enabled: true})
       void client.executeSlash('/settings').then(value => {$settings.set((value as any).settings)}).catch(() => {})
     }
+    const onBackendExit = () => failLtmMaintenanceFromBackendDisconnect()
     client.on('reinitialized', onReinitialized)
+    client.on('exit', onBackendExit)
     const disableFocusTracking = enableTerminalFocusTracking()
     void client.initialize().then(result => {
       applyNotificationSettings(result.notifications || {enabled: true})
@@ -524,6 +535,7 @@ export function SemaRavenApp() {
     return () => {
       stdout?.off('resize', resize)
       client.off('reinitialized', onReinitialized)
+      client.off('exit', onBackendExit)
       disableFocusTracking()
       client.dispose()
     }

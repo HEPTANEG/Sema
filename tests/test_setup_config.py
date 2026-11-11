@@ -71,6 +71,19 @@ def test_setup_test_fingerprint_and_failure_redaction(isolated_workspace, monkey
     assert "secret-token" not in str(setup_config.test("search"))
 
 
+def test_llm_setup_test_bounds_provider_output(monkeypatch):
+    calls = []
+
+    def fake_call(_messages, **kwargs):
+        calls.append(kwargs)
+        return {"choices": [{"message": {"content": "OK"}}]}
+
+    monkeypatch.setattr(provider, "call_chat_completion", fake_call)
+
+    assert setup_config._test("llm") == {}
+    assert calls[0]["max_tokens"] == 8
+
+
 def test_atomic_config_preserves_sections_on_failure(isolated_workspace, monkeypatch):
     provider.save_global_notification_config({"enabled": False})
     before = provider.global_config_path().read_bytes()

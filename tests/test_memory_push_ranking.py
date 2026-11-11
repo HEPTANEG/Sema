@@ -1,4 +1,5 @@
 import json
+import time
 
 
 def _candidate(object_id, title="Title", summary=None):
@@ -338,7 +339,25 @@ def test_run_memory_push_failure_is_fail_open_with_placeholder(monkeypatch):
     assert "Memory Push failed" in result["content"]
 
 
-def test_memory_push_runs_once_per_turn(monkeypatch):
+def test_run_memory_push_expired_deadline_is_fail_open():
+    import memory_engine.ltm.memory_push_ranking as ranking
+
+    result = ranking.run_memory_push(
+        [],
+        [],
+        runtime_state={
+            "_memory_push_deadline": time.monotonic() - 1,
+            "_context_build_trajectory_context": {"enabled": False},
+        },
+    )
+
+    assert result["status"] == "error"
+    assert result["diagnostic_only"] is True
+    assert result["metrics"]["reason_code"] == "deadline_exceeded"
+    assert "Memory Push failed" in result["content"]
+
+
+def test_memory_push_runs_once_per_turn(isolated_workspace, monkeypatch):
     import memory_engine.context_builder as context_builder
 
     calls = []
@@ -354,6 +373,25 @@ def test_memory_push_runs_once_per_turn(monkeypatch):
     assert len(calls) == 1
 
 
+def test_memory_push_foreground_deadline_is_one_minute(isolated_workspace, monkeypatch):
+    import memory_engine.context_builder as context_builder
+
+    deadlines = []
+
+    def fake_run_memory_push(*_args, **kwargs):
+        deadlines.append(kwargs["runtime_state"]["_memory_push_deadline"])
+        return {"status": "empty", "content": None, "metrics": {}}
+
+    monkeypatch.setattr(context_builder.memory_push_ranking, "run_memory_push", fake_run_memory_push)
+    runtime_state = {"_memory_push_enabled": True}
+    started = time.monotonic()
+    context_builder._memory_push_for_turn([], [], runtime_state)
+
+    assert len(deadlines) == 1
+    assert 59 <= deadlines[0] - started <= 61
+    assert "_memory_push_deadline" not in runtime_state
+
+
 def test_context_builder_injects_ltm_between_wm_and_stm(isolated_workspace, monkeypatch):
     import memory_engine.context_builder as context_builder
 
@@ -361,7 +399,7 @@ def test_context_builder_injects_ltm_between_wm_and_stm(isolated_workspace, monk
     monkeypatch.setattr(context_builder.memory_push_ranking, "validate_push_result", lambda result: result)
 
     monkeypatch.setattr(context_builder.focus, "run_focus_detector_before_context", lambda *_args: None)
-    monkeypatch.setattr(context_builder, "compute_and_store_dynamic_context_budget", lambda *_args, **_kwargs: {"budgets": {"stm": 1000, "wm": 1000}, "scores": {}})
+    monkeypatch.setattr(context_builder, "compute_and_store_dynamic_context_budget", lambda *_args, **_kwargs: {"budgets": {"stm_min": 1000, "stm_max": 50000, "stm": 1000, "wm_min": 1000, "wm_max": 50000, "wm": 1000}, "scores": {}, "signals": {}})
     monkeypatch.setattr(context_builder.event_stream, "load_active_trunk_records", lambda: [])
     monkeypatch.setattr(context_builder.wm_ingress, "stage_wm_ingress_from_projection", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -369,7 +407,8 @@ def test_context_builder_injects_ltm_between_wm_and_stm(isolated_workspace, monk
         "build_stm_projection",
         lambda *_args, **_kwargs: {
             "messages": [{"role": "system", "content": "system"}, {"role": "user", "content": "latest"}],
-            "selected_blocks": [],
+            "selected_units": [],
+            "omitted_units": [],
             "budget": 1000,
             "selected_tokens": 1,
             "wm_ingress_watermark": -1,

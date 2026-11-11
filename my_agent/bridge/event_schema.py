@@ -67,7 +67,8 @@ EVENT_SCHEMAS = {
     "agent_error": {"category": "error", "required": ("error",), "producer": "ui_bridge_server", "user_visible": True},
     "error": {"category": "error", "required": ("message",), "producer": "ui_bridge_server", "user_visible": True},
     "wake_delivered": {"category": "background", "required": ("wake_id", "source", "kind"), "producer": "wake_scheduler", "user_visible": False},
-    "wake_failed": {"category": "background", "required": ("wake_id", "error"), "producer": "wake_scheduler", "user_visible": False},
+    "wake_deferred": {"category": "background", "required": ("wake_id", "attempt", "reason"), "producer": "wake_scheduler", "user_visible": False},
+    "wake_failed": {"category": "background", "required": ("wake_id", "error", "attempt", "reason"), "producer": "wake_scheduler", "user_visible": False},
 }
 
 EVENT_TYPES = tuple(EVENT_SCHEMAS)

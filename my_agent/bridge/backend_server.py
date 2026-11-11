@@ -224,18 +224,18 @@ class BackendServer(BridgeServer):
 
         return load_notification_config()
 
-    def send_event(self, event_type, payload, turn_id=None):
+    def send_event(self, event_type, payload, turn_id=None, request_id=None, parent_id=None):
         resolved_turn_id = turn_id or self.current_turn_id or self.runtime_state.get("ui_turn_id") or ""
-        request_id = self.remote_request_ids.get(resolved_turn_id)
-        if request_id:
+        resolved_request_id = request_id or self.remote_request_ids.get(resolved_turn_id)
+        if resolved_request_id:
             if event_type == "final_answer":
-                self.remote_receipts.complete(request_id, payload.get("content") or "")
+                self.remote_receipts.complete(resolved_request_id, payload.get("content") or "")
             elif event_type in {"turn_cancelled", "agent_stopped"}:
-                self.remote_receipts.interrupt(request_id, payload.get("message") or "Remote request interrupted.")
+                self.remote_receipts.interrupt(resolved_request_id, payload.get("message") or "Remote request interrupted.")
             elif event_type in {"agent_error", "error"}:
-                self.remote_receipts.fail(request_id, payload.get("error") or payload.get("message") or "Remote request failed.")
+                self.remote_receipts.fail(resolved_request_id, payload.get("error") or payload.get("message") or "Remote request failed.")
         with self.write_lock:
-            event = self._event_payload(event_type, payload, turn_id)
+            event = self._event_payload(event_type, payload, turn_id, resolved_request_id, parent_id)
             with self.clients_lock:
                 clients = list(self.clients)
             for client in clients:
@@ -248,12 +248,15 @@ class BackendServer(BridgeServer):
         if event_type == "final_answer":
             self.runtime_state["ui_final_answer_sent"] = True
 
-    def _event_payload(self, event_type, payload, turn_id=None):
+    def _event_payload(self, event_type, payload, turn_id=None, request_id=None, parent_id=None):
         sequence = self._allocate_event_sequence()
         self._record_event_progress(event_type, payload)
+        resolved_turn_id = turn_id or self.current_turn_id or self.runtime_state.get("ui_turn_id") or self.runtime_state.get("trace_id") or ""
         return {
             "event_id": __import__("uuid").uuid4().hex,
-            "turn_id": turn_id or self.current_turn_id or self.runtime_state.get("ui_turn_id") or self.runtime_state.get("trace_id") or "",
+            "turn_id": resolved_turn_id,
+            "request_id": request_id or self._turn_request_ids.get(resolved_turn_id, ""),
+            "parent_id": parent_id or self._turn_parent_ids.get(resolved_turn_id, ""),
             "type": event_type,
             "sequence": sequence,
             "payload": payload,

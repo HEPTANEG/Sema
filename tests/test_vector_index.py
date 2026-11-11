@@ -1,5 +1,7 @@
 import concurrent.futures
 import json
+import subprocess
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -16,6 +18,40 @@ def _vector(index):
 
 def _metadata():
     return vector_index._expected_metadata()
+
+
+def test_staging_worker_failure_preserves_original_index(isolated_workspace, monkeypatch):
+    adapter = vector_index.VectorIndexAdapter()
+    adapter.upsert("mem_old", _vector(0), _metadata())
+    before_index = adapter.index_path.read_bytes()
+    before_metadata = adapter.metadata_path.read_bytes()
+    monkeypatch.setattr(vector_index.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=3221225477, stderr="access violation", stdout=""))
+    with pytest.raises(vector_index.VectorIndexUnavailable, match="access violation"):
+        adapter.stage_upserts([{"object_id": "mem_new", "vector": _vector(1)}])
+    assert adapter.index_path.read_bytes() == before_index
+    assert adapter.metadata_path.read_bytes() == before_metadata
+    assert adapter.search(_vector(0), 1)[0]["object_id"] == "mem_old"
+
+
+def test_staging_worker_commits_only_after_install(isolated_workspace):
+    adapter = vector_index.VectorIndexAdapter()
+    adapter.upsert("mem_old", _vector(0), _metadata())
+    staged = adapter.stage_upserts([{"object_id": "mem_new", "vector": _vector(1)}])
+    assert adapter.object_ids() == ["mem_old"]
+    adapter.install_staged(staged)
+    assert adapter.object_ids() == ["mem_new", "mem_old"]
+
+
+def test_staging_worker_timeout_preserves_original_index(isolated_workspace, monkeypatch):
+    adapter = vector_index.VectorIndexAdapter()
+    adapter.upsert("mem_old", _vector(0), _metadata())
+    original = adapter.index_path.read_bytes()
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+    monkeypatch.setattr(vector_index.subprocess, "run", timeout)
+    with pytest.raises(vector_index.VectorIndexUnavailable, match="timed out"):
+        adapter.stage_upserts([{"object_id": "mem_new", "vector": _vector(1)}])
+    assert adapter.index_path.read_bytes() == original
 
 
 def test_bulk_removal_recovers_between_file_replacements(isolated_workspace, monkeypatch):

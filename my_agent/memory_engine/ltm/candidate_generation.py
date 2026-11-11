@@ -6,7 +6,8 @@ Callers provide their own query hypotheses and keep the returned pool in their
 own scope (Push runtime or a Retrieval Session).
 """
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import time
 
 from . import ltm_retrieval
 
@@ -67,22 +68,26 @@ def _adapt_result(result, query_id, hypothesis, source):
     return candidates
 
 
-def _run_semantic_batch(jobs, profile, root=None, diagnostic_profiler=None):
+def _run_semantic_batch(jobs, profile, root=None, diagnostic_profiler=None, deadline=None):
     queries = [job[2] for job in jobs]
+    retrieval_kwargs = {"profile": profile, "root": root}
+    if deadline is not None:
+        retrieval_kwargs["deadline"] = deadline
     if diagnostic_profiler is None:
-        results = ltm_retrieval.semantic_search_many(queries, profile=profile, root=root)
+        results = ltm_retrieval.semantic_search_many(queries, **retrieval_kwargs)
     else:
         with diagnostic_profiler.measure("semantic_retrieval_ms"):
-            results = ltm_retrieval.semantic_search_many(
-                queries, profile=profile, root=root, _diagnostic_profiler=diagnostic_profiler,
-            )
+            retrieval_kwargs["_diagnostic_profiler"] = diagnostic_profiler
+            results = ltm_retrieval.semantic_search_many(queries, **retrieval_kwargs)
     return [
         (job, result, _adapt_result(result, job[0], job[1], job[3]))
         for job, result in zip(jobs, results)
     ]
 
 
-def _run_lexical_job(job, profile, root=None, diagnostic_profiler=None):
+def _run_lexical_job(job, profile, root=None, diagnostic_profiler=None, deadline=None):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RuntimeError("Memory Push exceeded its foreground time budget.")
     return _lexical_query(job[2], profile, root=root, diagnostic_profiler=diagnostic_profiler)
 
 
@@ -171,7 +176,7 @@ def _jobs(hypotheses):
     return jobs
 
 
-def build_candidate_pool(hypotheses, *, profile=None, root=None, diagnostic_profiler=None):
+def build_candidate_pool(hypotheses, *, profile=None, root=None, diagnostic_profiler=None, deadline=None):
     """Search the requested hypotheses through embedding and lexical services.
 
     Partial service failures are isolated and returned in ``errors``.  The
@@ -185,15 +190,30 @@ def build_candidate_pool(hypotheses, *, profile=None, root=None, diagnostic_prof
     candidates, errors, successful = [], [], 0
     semantic_jobs = [job for job in jobs if job[3] == "embedding"]
     lexical_jobs = [job for job in jobs if job[3] == "lexical"]
-    with ThreadPoolExecutor(max_workers=min(8, len(lexical_jobs) + bool(semantic_jobs))) as executor:
-        semantic_future = executor.submit(_run_semantic_batch, semantic_jobs, profile, root, diagnostic_profiler) if semantic_jobs else None
+    executor = ThreadPoolExecutor(max_workers=min(8, len(lexical_jobs) + bool(semantic_jobs)))
+    try:
+        semantic_future = executor.submit(_run_semantic_batch, semantic_jobs, profile, root, diagnostic_profiler, deadline) if semantic_jobs else None
         lexical_futures = [
-            (job, executor.submit(_run_lexical_job, job, profile, root, diagnostic_profiler))
+            (job, executor.submit(_run_lexical_job, job, profile, root, diagnostic_profiler, deadline))
             for job in lexical_jobs
         ]
         if semantic_future is not None:
             try:
-                results = semantic_future.result()
+                timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+                results = semantic_future.result(timeout=timeout)
+            except FutureTimeoutError:
+                results = [
+                    (
+                        job,
+                        {
+                            "status": "error",
+                            "items": [],
+                            "errors": [{"error": "Memory Push exceeded its foreground time budget."}],
+                        },
+                        [],
+                    )
+                    for job in semantic_jobs
+                ]
             except Exception as error:
                 results = [(job, {"status": "error", "items": [], "errors": [{"error": str(error)}]}, []) for job in semantic_jobs]
             for job, result, adapted in results:
@@ -204,8 +224,12 @@ def build_candidate_pool(hypotheses, *, profile=None, root=None, diagnostic_prof
                     errors.append({"query_id": job[0], "hypothesis": job[1], "source": job[3], "errors": result.get("errors", [])})
         for job, future in lexical_futures:
             try:
-                result = future.result()
+                timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+                result = future.result(timeout=timeout)
                 adapted = _adapt_result(result, job[0], job[1], job[3])
+            except FutureTimeoutError:
+                errors.append({"query_id": job[0], "hypothesis": job[1], "source": job[3], "error": "Memory Push exceeded its foreground time budget."})
+                continue
             except Exception as error:
                 errors.append({"query_id": job[0], "hypothesis": job[1], "source": job[3], "error": str(error)})
                 continue
@@ -214,6 +238,11 @@ def build_candidate_pool(hypotheses, *, profile=None, root=None, diagnostic_prof
                 candidates.extend(adapted)
             else:
                 errors.append({"query_id": job[0], "hypothesis": job[1], "source": job[3], "errors": result.get("errors", [])})
-    items, query_evidence = _integrate(candidates)
-    status = "partial" if errors and items else "error" if errors and successful == 0 else "ok"
-    return {"status": status, "items": items, "query_evidence": query_evidence, "errors": errors}
+        items, query_evidence = _integrate(candidates)
+        status = "partial" if errors and items else "error" if errors and successful == 0 else "ok"
+        return {"status": status, "items": items, "query_evidence": query_evidence, "errors": errors}
+    finally:
+        for future in [semantic_future, *[future for _job, future in lexical_futures]]:
+            if future is not None:
+                future.cancel()
+        executor.shutdown(wait=deadline is None, cancel_futures=deadline is not None)

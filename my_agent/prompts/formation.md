@@ -28,6 +28,10 @@ assertion for an isolated fact, preference, constraint, or conclusion. Do not
 create an episode only because a range is long. For an episode, use
 structured_data only when the supplied evidence supports a time_scope;
 otherwise use null.
+Episode `structured_data` must be `null`, `{}`, or an object containing only
+`time_scope`. A non-empty `time_scope` must contain at least one of `start`,
+`end`, or `anchor`; `precision`, when present, must be `exact`, `approximate`,
+or `relative`. Do not add other fields. An empty object is stored as null.
 
 Follow the LTM Core Store payload-size contract exactly. Payload size is the UTF-8 byte size of body plus canonical structured_data JSON:
 - At or below 2 KiB: summary must be null. Do not restate a short body in summary.

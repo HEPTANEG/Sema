@@ -64,7 +64,19 @@ def public_model():
         config["api_key_source"] = provider.api_key_for_config(config)[1]
     except RuntimeError:
         config["api_key_source"] = "missing"
-    overrides = {key: env for key, env in {"provider": "SEMA_PROVIDER", "model": "SEMA_MODEL", "base_url": "SEMA_BASE_URL", "api_key_env": "SEMA_API_KEY_ENV"}.items() if os.getenv(env)}
+    saved = provider._configured_model_section()
+    overrides = {}
+    if not saved.get("provider") and os.getenv("SEMA_PROVIDER"):
+        overrides["provider"] = "SEMA_PROVIDER"
+    if not saved.get("model"):
+        if os.getenv("SEMA_MODEL"):
+            overrides["model"] = "SEMA_MODEL"
+        elif config.get("provider") == "deepseek" and os.getenv("DEEPSEEK_MODEL"):
+            overrides["model"] = "DEEPSEEK_MODEL"
+    if not saved.get("base_url") and os.getenv("SEMA_BASE_URL"):
+        overrides["base_url"] = "SEMA_BASE_URL"
+    if not saved.get("api_key_env") and os.getenv("SEMA_API_KEY_ENV"):
+        overrides["api_key_env"] = "SEMA_API_KEY_ENV"
     config["environment_overrides"] = overrides
     config.pop("api_key", None)
     return config
@@ -193,7 +205,11 @@ def _test(component):
     if component == "llm":
         from memory_engine.token_counter import count_text_tokens
         count_text_tokens("Sema setup")
-        result = provider.call_chat_completion([{"role": "user", "content": "Reply OK."}], purpose="setup connection test")
+        result = provider.call_chat_completion(
+            [{"role": "user", "content": "Reply OK."}],
+            max_tokens=8,
+            purpose="setup connection test",
+        )
         if not result.get("choices"):
             raise RuntimeError("No response")
         return {}

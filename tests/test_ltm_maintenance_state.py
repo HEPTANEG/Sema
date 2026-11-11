@@ -1,3 +1,5 @@
+import os
+
 from memory_engine import event_stream
 from memory_engine.ltm import formation, ltm_store, maintenance_pressure
 
@@ -13,7 +15,7 @@ def test_maintenance_state_starts_before_slot_zero_and_advances_continuously(iso
     state = ltm_store.get_maintenance_runtime_state(isolated_workspace)
     assert state["maintenance_coverage_cursor"] == -1
     assert state["latest_event_stream_slot_seq"] == 2
-    assert state["maintenance_pressure"] == 3 / 100
+    assert state["maintenance_pressure"] == 3 / 200
     run = ltm_store.start_or_resume_maintenance_run(isolated_workspace)
     assert run["status"] == "started"
     assert ltm_store.advance_maintenance_coverage(run["run_id"], 1, isolated_workspace)["status"] == "advanced"
@@ -40,6 +42,29 @@ def test_failed_run_resumes_with_same_id_and_completion_keeps_last_fifty_reports
         assert connection.execute("SELECT COUNT(*) FROM maintenance_reports").fetchone()[0] == 1
     finally:
         connection.close()
+
+
+def test_dead_running_owner_starts_new_run_without_reusing_run_id(isolated_workspace):
+    original = ltm_store.start_or_resume_maintenance_run(isolated_workspace)
+    connection = ltm_store._connect(isolated_workspace)
+    try:
+        connection.execute(
+            "UPDATE maintenance_runtime_state SET run_owner_pid=?, next_plan_index=3, last_committed_plan_index=2 WHERE state_id=1",
+            (os.getpid() + 1000000,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    restarted = ltm_store.start_or_resume_maintenance_run(isolated_workspace)
+
+    assert restarted["status"] == "started_after_interruption"
+    assert restarted["run_id"] != original["run_id"]
+    assert restarted["interrupted_run_id"] == original["run_id"]
+    state = ltm_store.get_maintenance_runtime_state(isolated_workspace)
+    assert state["run_owner_pid"] == os.getpid()
+    assert state["next_plan_index"] == 3
+    assert state["last_committed_plan_index"] == 2
 
 
 def test_maintenance_state_schema_migration_adds_runner_columns(isolated_workspace):
@@ -79,6 +104,8 @@ def test_maintenance_state_schema_migration_adds_runner_columns(isolated_workspa
         columns = {row["name"] for row in migrated.execute("PRAGMA table_info(maintenance_runtime_state)")}
         report_columns = {row["name"] for row in migrated.execute("PRAGMA table_info(maintenance_reports)")}
         assert "run_start_cursor" in columns
+        assert "run_owner_pid" in columns
+        assert "run_heartbeat_at" in columns
         assert "plan_commit_count" in report_columns
         assert "semantic_digest_status" in report_columns
         assert "semantic_digest_id" in report_columns
@@ -94,13 +121,13 @@ def test_maintenance_state_schema_migration_adds_runner_columns(isolated_workspa
     assert run["state"]["run_start_cursor"] == -1
 
 
-def test_maintenance_pressure_uses_one_hundred_slot_threshold(isolated_workspace, monkeypatch):
-    _append(isolated_workspace, 100)
-    monkeypatch.setattr(formation, "maintainable_slot_frontier", lambda **_kwargs: 99)
+def test_maintenance_pressure_uses_two_hundred_slot_threshold(isolated_workspace, monkeypatch):
+    _append(isolated_workspace, 200)
+    monkeypatch.setattr(formation, "maintainable_slot_frontier", lambda **_kwargs: 199)
 
     state = ltm_store.get_maintenance_runtime_state(isolated_workspace)
 
-    assert state["unmaintained_slot_count"] == 100
+    assert state["unmaintained_slot_count"] == 200
     assert state["maintenance_pressure"] == 1.0
 
 
@@ -121,7 +148,21 @@ def test_pressure_snapshot_uses_formation_frontier_not_latest_slot(isolated_work
     assert snapshot["latest_event_stream_slot_seq"] == 9
     assert snapshot["maintainable_frontier"] == 4
     assert snapshot["unmaintained_slot_count"] == 5
-    assert snapshot["pressure"] == 0.05
+    assert snapshot["pressure"] == 0.025
+
+
+def test_pressure_snapshot_recomputes_frontier_instead_of_using_stale_runtime_value(monkeypatch):
+    monkeypatch.setattr(ltm_store, "get_maintenance_runtime_state", lambda _root=None: {
+        "maintainable_frontier": 1,
+        "maintenance_coverage_cursor": 4,
+        "latest_event_stream_slot_seq": 99,
+    })
+    monkeypatch.setattr(formation, "maintainable_slot_frontier", lambda **_kwargs: 17)
+
+    snapshot = maintenance_pressure.maintenance_pressure_snapshot()
+
+    assert snapshot["maintainable_frontier"] == 17
+    assert snapshot["unmaintained_slot_count"] == 13
 
 
 def test_formation_buffer_frontier_is_the_newest_buffer_slot(isolated_workspace, monkeypatch):

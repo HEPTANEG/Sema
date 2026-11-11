@@ -200,6 +200,25 @@ def tool_call_to_request(tool_call):
             },
         }
 
+    if name == "sleep_for_maintenance":
+        return {
+            "tool": "sleep_for_maintenance",
+            "args": {
+                "wake_prompt": require_string(arguments, "wake_prompt", name),
+            },
+        }
+
+    if name == "retry_ltm_maintenance":
+        return {"tool": "retry_ltm_maintenance", "args": {}}
+
+    if name == "return_maintenance_failure":
+        return {
+            "tool": "return_maintenance_failure",
+            "args": {
+                "message": require_string(arguments, "message", name),
+            },
+        }
+
     raise RuntimeError(f"Unknown structured tool call: {name}")
 
 

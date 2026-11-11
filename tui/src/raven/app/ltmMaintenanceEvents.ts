@@ -152,6 +152,10 @@ export const failLtmMaintenanceFromSlashError = (message: string) => {
   finishMaintenanceTurn('failed', { failure_reason: message, status: 'failed' })
 }
 
+export const failLtmMaintenanceFromBackendDisconnect = () => {
+  failLtmMaintenanceFromSlashError('Backend connection was lost during maintenance. The run may have been interrupted; check its status before retrying.')
+}
+
 const toolSummary = (payload: Record<string, unknown>) => {
   const result = isRecord(payload.result) ? payload.result : {}
   const status = asText(payload.status || result.status || 'ok')

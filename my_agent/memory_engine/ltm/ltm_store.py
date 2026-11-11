@@ -6,6 +6,7 @@ It does not perform semantic extraction, retrieval, ranking, or maintenance.
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -15,17 +16,19 @@ from uuid import uuid4
 from .. import event_stream
 from ..token_counter import count_text_tokens
 from .storage_gate import serialized_write
+from .embedding_adapter import EmbeddingServiceTimeout
 
 
 LTM_DIR_NAME = "ltm"
 LTM_DB_NAME = "ltm.db"
 
 LTM_SCHEMA_VERSION = 1
-LTM_DB_SCHEMA_VERSION = 10
+LTM_DB_SCHEMA_VERSION = 11
 LTM_FTS_TABLE = "memory_objects_fts"
 SUMMARY_THRESHOLD_BYTES = 2 * 1024
 SPLIT_THRESHOLD_BYTES = 8 * 1024
 BUSY_TIMEOUT_MS = 5000
+MAINTENANCE_VECTOR_SYNC_TIMEOUT_SECONDS = 120
 OBJECT_TYPES = {"assertion", "tag", "episode"}
 LINK_STATES = {"active", "inactive"}
 RELATION_TYPES = {"sourced_from", "tagged_with", "supports", "contradicts", "supersedes"}
@@ -38,6 +41,13 @@ STRENGTH_HALF_LIFE_SLOTS = 2000
 PUSH_STRENGTH_THRESHOLD = 0.1
 DELETION_STRENGTH_THRESHOLD = 0.01
 OBJECT_ID_RE = re.compile(r"^mem_[0-9a-f]{32}$")
+EPISODE_STRUCTURED_DATA_ERROR_CODES = frozenset({
+    "episode_schema",
+    "time_scope",
+    "time_scope_fields",
+    "empty_time_scope",
+    "time_scope_precision",
+})
 
 
 def _now():
@@ -158,6 +168,8 @@ def _create_core_schema(connection):
             run_status TEXT NOT NULL DEFAULT 'idle',
             run_started_at TEXT,
             run_start_cursor INTEGER,
+            run_owner_pid INTEGER,
+            run_heartbeat_at TEXT,
             last_checkpoint_slot_seq INTEGER,
             next_plan_index INTEGER NOT NULL DEFAULT 0,
             last_committed_plan_index INTEGER,
@@ -230,6 +242,8 @@ def _ensure_maintenance_schema(connection):
     runtime_columns = _columns(connection, "maintenance_runtime_state")
     for column, definition in (
         ("run_start_cursor", "INTEGER"),
+        ("run_owner_pid", "INTEGER"),
+        ("run_heartbeat_at", "TEXT"),
         ("last_checkpoint_slot_seq", "INTEGER"),
         ("next_plan_index", "INTEGER NOT NULL DEFAULT 0"),
         ("last_committed_plan_index", "INTEGER"),
@@ -756,8 +770,11 @@ def _sync_retrieval_index_object(connection, object_id):
     )
 
 
-def _error(code, path, message):
-    return {"code": code, "path": path, "message": message}
+def _error(code, path, message, details=None):
+    result = {"code": code, "path": path, "message": message}
+    if details:
+        result["details"] = details
+    return result
 
 
 def _canonical_json(value):
@@ -777,7 +794,9 @@ def _validate_title(title, errors, path):
         return
     count = count_text_tokens(title)
     if count < 1 or count > 50:
-        errors.append(_error("title_length", path, "title must contain 1-50 tokens."))
+        error = _error("title_length", path, "title must contain 1-50 tokens.")
+        error.update({"actual_tokens": count, "min_tokens": 1, "max_tokens": 50})
+        errors.append(error)
 
 
 def _validate_payload(obj, errors, path):
@@ -785,7 +804,13 @@ def _validate_payload(obj, errors, path):
     summary = obj.get("summary")
     if payload is None:
         if summary not in (None, ""):
-            errors.append(_error("summary_without_payload", f"{path}.summary", "summary requires a payload."))
+            error = _error("summary_without_payload", f"{path}.summary", "summary requires a payload.")
+            error.update({
+                "actual_payload_bytes": 0,
+                "summary_threshold_bytes": SUMMARY_THRESHOLD_BYTES,
+                "max_payload_bytes": SPLIT_THRESHOLD_BYTES,
+            })
+            errors.append(error)
         return None
     if not isinstance(payload, dict):
         errors.append(_error("invalid_payload", f"{path}.payload", "payload must be an object."))
@@ -806,8 +831,8 @@ def _validate_payload(obj, errors, path):
         unknown = set(structured) - {"time_scope"}
         if unknown:
             errors.append(_error("episode_schema", f"{path}.payload.structured_data", "episode structured_data only allows time_scope."))
-        time_scope = structured.get("time_scope")
-        if time_scope is not None:
+        if "time_scope" in structured:
+            time_scope = structured.get("time_scope")
             if not isinstance(time_scope, dict):
                 errors.append(_error("time_scope", f"{path}.payload.structured_data.time_scope", "time_scope must be an object."))
             else:
@@ -816,7 +841,7 @@ def _validate_payload(obj, errors, path):
                     errors.append(_error("time_scope_fields", f"{path}.payload.structured_data.time_scope", "unknown time_scope field."))
                 if not any(time_scope.get(key) not in (None, "") for key in ("start", "end", "anchor")):
                     errors.append(_error("empty_time_scope", f"{path}.payload.structured_data.time_scope", "time_scope needs start, end, or anchor."))
-                if time_scope.get("precision") not in (None, "exact", "approximate", "relative"):
+                if "precision" in time_scope and time_scope.get("precision") not in {"exact", "approximate", "relative"}:
                     errors.append(_error("time_scope_precision", f"{path}.payload.structured_data.time_scope.precision", "precision must be exact, approximate, or relative."))
     normalized_payload = {
         "schema_version": payload.get("schema_version"),
@@ -827,11 +852,29 @@ def _validate_payload(obj, errors, path):
     if payload_size == 0:
         errors.append(_error("empty_payload", f"{path}.payload", "payload must contain body or structured_data."))
     elif payload_size <= SUMMARY_THRESHOLD_BYTES and summary not in (None, ""):
-        errors.append(_error("unexpected_summary", f"{path}.summary", "summary must be empty for payloads up to 2 KiB."))
+        error = _error("unexpected_summary", f"{path}.summary", "summary must be empty for payloads up to 2 KiB.")
+        error.update({
+            "actual_payload_bytes": payload_size,
+            "summary_threshold_bytes": SUMMARY_THRESHOLD_BYTES,
+            "max_payload_bytes": SPLIT_THRESHOLD_BYTES,
+        })
+        errors.append(error)
     elif SUMMARY_THRESHOLD_BYTES < payload_size <= SPLIT_THRESHOLD_BYTES and not isinstance(summary, str):
-        errors.append(_error("missing_summary", f"{path}.summary", "summary is required for payloads over 2 KiB."))
+        error = _error("missing_summary", f"{path}.summary", "summary is required for payloads over 2 KiB.")
+        error.update({
+            "actual_payload_bytes": payload_size,
+            "summary_threshold_bytes": SUMMARY_THRESHOLD_BYTES,
+            "max_payload_bytes": SPLIT_THRESHOLD_BYTES,
+        })
+        errors.append(error)
     elif payload_size > SPLIT_THRESHOLD_BYTES:
-        errors.append(_error("payload_too_large", f"{path}.payload", "payload over 8 KiB must be split into multiple MemoryObjects."))
+        error = _error("payload_too_large", f"{path}.payload", "payload over 8 KiB must be split into multiple MemoryObjects.")
+        error.update({
+            "actual_payload_bytes": payload_size,
+            "summary_threshold_bytes": SUMMARY_THRESHOLD_BYTES,
+            "max_payload_bytes": SPLIT_THRESHOLD_BYTES,
+        })
+        errors.append(error)
     return normalized_payload
 
 
@@ -945,7 +988,40 @@ def _validate_link(link, index, connection, objects_by_id, root, errors):
     if relation in {"supports", "contradicts", "supersedes"} and target_kind == "event_slot":
         valid_relation = False
     if not valid_relation:
-        errors.append(_error("relation_contract", path, "relation_type is incompatible with source or target type."))
+        if relation in {"supports", "contradicts"}:
+            message = (
+                f"{relation} requires a source assertion or episode and a target assertion; "
+                f"got source {source_type or 'unknown'} and target {target_type or target_kind}."
+            )
+        elif relation == "tagged_with":
+            message = f"tagged_with requires a target tag; got target {target_type or target_kind}."
+        elif relation == "sourced_from":
+            message = f"sourced_from requires an Event Stream slot target; got target {target_type or target_kind}."
+        else:
+            message = (
+                f"supersedes requires MemoryObject endpoints; got source {source_type or 'unknown'} "
+                f"and target {target_type or target_kind}."
+            )
+        expected = {
+            "supports": {"source": ["assertion", "episode"], "target": ["assertion"]},
+            "contradicts": {"source": ["assertion", "episode"], "target": ["assertion"]},
+            "tagged_with": {"source": ["assertion", "tag", "episode"], "target": ["tag"]},
+            "sourced_from": {"source": ["assertion", "tag", "episode"], "target": ["event_slot"]},
+            "supersedes": {"source": ["assertion", "tag", "episode"], "target": ["assertion", "tag", "episode"]},
+        }.get(relation)
+        errors.append(_error(
+            "relation_contract",
+            path,
+            message,
+            {
+                "relation_type": relation,
+                "expected": expected,
+                "actual": {
+                    "source": source_type or "unknown",
+                    "target": target_type or target_kind,
+                },
+            },
+        ))
     return {
         "source_object_id": source_id,
         "target_kind": target_kind,
@@ -1149,12 +1225,15 @@ def _all_object_ids(connection):
     return [row["object_id"] for row in connection.execute("SELECT object_id FROM live_memory_objects")]
 
 
-def _stage_vector_objects(objects, root=None):
+def _stage_vector_objects(objects, root=None, timeout_seconds=None, phase_callback=None):
     from . import vector_index
 
     if not objects:
         return None
-    return vector_index.stage_object_upserts(objects, root=root)
+    kwargs = {"root": root, "timeout_seconds": timeout_seconds}
+    if phase_callback is not None:
+        kwargs["phase_callback"] = phase_callback
+    return vector_index.stage_object_upserts(objects, **kwargs)
 
 
 def _install_staged_vector(staged, root=None):
@@ -1302,15 +1381,29 @@ def _maintenance_update_candidates(connection, updates, errors):
 
 
 @serialized_write
-def commit_maintenance_plan(compiled_plan, idempotency_key, root=None):
+def commit_maintenance_plan(compiled_plan, idempotency_key, root=None, phase_callback=None):
     """Commit an already deterministic Maintainer plan as one Store transaction."""
     if not isinstance(compiled_plan, dict) or not isinstance(idempotency_key, str) or not idempotency_key.strip():
         return {"status": "rejected", "errors": [_error("invalid_plan", "plan", "compiled plan and idempotency key are required.")]}
     creates = {"objects": compiled_plan.get("objects") or [], "links": compiled_plan.get("links") or []}
     deactivate_ids = list(compiled_plan.get("deactivate_link_ids") or [])
     updates = list(compiled_plan.get("updates") or [])
-    connection = ensure_ltm_store(root)
+    def notify(phase, status, detail=None):
+        if callable(phase_callback):
+            try:
+                phase_callback(phase, status, detail or {})
+            except Exception:
+                pass
+
+    notify("ensure_ltm_store", "started")
+    try:
+        connection = ensure_ltm_store(root)
+    except Exception as error:
+        notify("ensure_ltm_store", "failed", {"error": str(error)})
+        raise
+    notify("ensure_ltm_store", "completed")
     staged_vector = None
+    sqlite_started = False
     try:
         request_hash = hashlib.sha256(_canonical_json(compiled_plan).encode("utf-8")).hexdigest()
         existing = _operation(connection, idempotency_key)
@@ -1333,12 +1426,29 @@ def commit_maintenance_plan(compiled_plan, idempotency_key, root=None):
         vector_objects = [{"object_id": obj["object_id"], "title": obj["title"], "summary": obj["summary"], "payload": obj["payload"]} for obj in initial["normalized_plan"]["objects"]]
         for update in update_candidates:
             vector_objects.append({"object_id": update["object_id"], "title": update["value"] if update["field"] == "title" else update["row"]["title"], "summary": update["value"] if update["field"] == "summary" else update["row"]["summary"], "payload": update["payload"]})
-        try: staged_vector = _stage_vector_objects(vector_objects, root)
-        except Exception as error: return {"status": "rejected", "errors": [_error("vector_sync", "vector_index", str(error))]}
+        notify("stage_vector_embedding", "started", {"object_count": len(vector_objects)})
+        try:
+            staged_vector = _stage_vector_objects(
+                vector_objects,
+                root,
+                timeout_seconds=MAINTENANCE_VECTOR_SYNC_TIMEOUT_SECONDS,
+                phase_callback=notify if phase_callback is not None else None,
+            )
+        except EmbeddingServiceTimeout as error:
+            notify("stage_vector_embedding", "failed", {"code": "vector_sync_timeout", "error": str(error)})
+            return {"status": "rejected", "errors": [_error("vector_sync_timeout", "vector_index", str(error))]}
+        except Exception as error:
+            notify("stage_vector_embedding", "failed", {"code": "vector_sync", "error": str(error)})
+            return {"status": "rejected", "errors": [_error("vector_sync", "vector_index", str(error))]}
+        notify("stage_vector_embedding", "completed", {"object_count": len(vector_objects)})
+        notify("sqlite_commit", "started")
+        sqlite_started = True
         connection.execute("BEGIN IMMEDIATE")
         verified = _validate_against_connection(creates, connection, root) if (creates["objects"] or creates["links"]) else {"valid": True, "errors": [], "normalized_plan": creates}
         if not verified["valid"]:
-            connection.rollback(); return {"status": "rejected", "errors": verified["errors"]}
+            connection.rollback()
+            notify("sqlite_commit", "failed", {"status": "rejected", "errors": verified["errors"]})
+            return {"status": "rejected", "errors": verified["errors"]}
         now, affected, object_ids, link_ids = _now(), set(), [], []
         for obj in verified["normalized_plan"]["objects"]:
             object_ids.append(obj["object_id"]); affected.add(obj["object_id"])
@@ -1367,9 +1477,19 @@ def commit_maintenance_plan(compiled_plan, idempotency_key, root=None):
         result = {"status": "committed", "commit_id": _new_id("commit"), "plan_id": compiled_plan.get("plan_id"), "idempotency_key": idempotency_key, "object_ids": object_ids, "link_ids": link_ids, "deactivated_link_ids": deactivate_ids, "updated_object_ids": sorted(set(updated_ids)), "temp_id_map": compiled_plan.get("temp_id_map") or {}, "report_counter_hints": counter_hints, "errors": []}
         connection.execute("INSERT INTO ltm_operations(idempotency_key, operation_type, request_hash, result_json, created_at) VALUES (?, 'maintenance_plan', ?, ?, ?)", (idempotency_key, request_hash, _canonical_json(result), now))
         if staged_vector:
-            journal_id = _new_id("vector_journal"); connection.execute("INSERT INTO ltm_vector_journal(journal_id, state, staged_index_path, staged_metadata_path, created_at, updated_at) VALUES (?, 'prepared', ?, ?, ?, ?)", (journal_id, staged_vector["index_path"], staged_vector["metadata_path"], now, now)); _install_staged_vector(staged_vector, root); connection.execute("UPDATE ltm_vector_journal SET state='completed', updated_at=? WHERE journal_id=?", (_now(), journal_id))
-        connection.commit(); return result
-    except Exception:
+            journal_id = _new_id("vector_journal"); connection.execute("INSERT INTO ltm_vector_journal(journal_id, state, staged_index_path, staged_metadata_path, created_at, updated_at) VALUES (?, 'prepared', ?, ?, ?, ?)", (journal_id, staged_vector["index_path"], staged_vector["metadata_path"], now, now))
+            notify("install_vector_index", "started")
+            try:
+                _install_staged_vector(staged_vector, root)
+            except Exception as error:
+                notify("install_vector_index", "failed", {"error": str(error)})
+                raise
+            notify("install_vector_index", "completed")
+            connection.execute("UPDATE ltm_vector_journal SET state='completed', updated_at=? WHERE journal_id=?", (_now(), journal_id))
+        connection.commit(); notify("sqlite_commit", "completed"); return result
+    except Exception as error:
+        if sqlite_started:
+            notify("sqlite_commit", "failed", {"error": str(error)})
         connection.rollback()
         try: _discard_staged_vector(staged_vector, root)
         except Exception: pass
@@ -1531,7 +1651,7 @@ def get_memory_link(link_id, root=None):
         connection.close()
 
 
-MAINTENANCE_PRESSURE_THRESHOLD = 100
+MAINTENANCE_PRESSURE_THRESHOLD = 200
 MAINTENANCE_REPORT_COUNTER_KEYS = (
     "plan_commit_count",
     "created_object_count",
@@ -1647,6 +1767,7 @@ def get_maintenance_runtime_state(root=None):
             "maintenance_coverage_cursor": -1, "active_run_id": None,
             "run_status": "idle", "run_started_at": None,
             "run_start_cursor": None,
+            "run_owner_pid": None, "run_heartbeat_at": None,
             "last_checkpoint_slot_seq": None, "next_plan_index": 0,
             "last_committed_plan_index": None, "last_failure_slot_seq": None,
             "last_failure_reason": None, "last_failure_at": None, "updated_at": None,
@@ -1660,6 +1781,7 @@ def get_maintenance_runtime_state(root=None):
                 "maintenance_coverage_cursor": -1, "active_run_id": None,
                 "run_status": "idle", "run_started_at": None,
                 "run_start_cursor": None,
+                "run_owner_pid": None, "run_heartbeat_at": None,
                 "last_checkpoint_slot_seq": None, "next_plan_index": 0,
                 "last_committed_plan_index": None, "last_failure_slot_seq": None,
                 "last_failure_reason": None, "last_failure_at": None, "updated_at": None,
@@ -1676,31 +1798,74 @@ def _require_maintenance_run(connection, run_id):
     return row
 
 
+def _process_is_alive(pid):
+    if pid is None:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except PermissionError:
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
 def start_or_resume_maintenance_run(root=None):
     connection = ensure_ltm_store(root)
     try:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute("SELECT * FROM maintenance_runtime_state WHERE state_id = 1").fetchone()
         now = _now()
-        if row["run_status"] in {"running", "failed"}:
+        interrupted_run_id = None
+        stale_running = row["run_status"] == "running" and not _process_is_alive(row["run_owner_pid"])
+        if row["run_status"] == "running" and not stale_running:
             run_id = row["active_run_id"]
-            connection.execute("UPDATE maintenance_runtime_state SET run_status = 'running', updated_at = ? WHERE state_id = 1", (now,))
-            status = "resumed" if row["run_status"] == "failed" else "running"
+            connection.execute("UPDATE maintenance_runtime_state SET run_status = 'running', run_owner_pid=?, run_heartbeat_at=?, updated_at = ? WHERE state_id = 1", (os.getpid(), now, now))
+            status = "running"
+        elif row["run_status"] == "failed":
+            run_id = row["active_run_id"]
+            connection.execute("UPDATE maintenance_runtime_state SET run_status = 'running', run_owner_pid=?, run_heartbeat_at=?, updated_at = ? WHERE state_id = 1", (os.getpid(), now, now))
+            status = "resumed"
         else:
+            interrupted_run_id = row["active_run_id"] if stale_running else None
             run_id = _new_id("maintenance_run")
             connection.execute(
                 """UPDATE maintenance_runtime_state SET active_run_id=?, run_status='running',
                    run_started_at=?, last_checkpoint_slot_seq=maintenance_coverage_cursor,
                    run_start_cursor=maintenance_coverage_cursor,
-                   next_plan_index=0, last_committed_plan_index=NULL,
+                   run_owner_pid=?, run_heartbeat_at=?,
+                   next_plan_index=?, last_committed_plan_index=?,
                    last_failure_slot_seq=NULL, last_failure_reason=NULL, last_failure_at=NULL,
                    updated_at=? WHERE state_id=1""",
-                (run_id, now, now),
+                (run_id, now, os.getpid(), now, int(row["next_plan_index"] or 0), row["last_committed_plan_index"], now),
             )
-            status = "started"
+            status = "started_after_interruption" if interrupted_run_id else "started"
         connection.commit()
         state = get_maintenance_runtime_state(root)
-        return {"status": status, "run_id": run_id, "state": state}
+        result = {"status": status, "run_id": run_id, "state": state}
+        if interrupted_run_id:
+            result["interrupted_run_id"] = interrupted_run_id
+        return result
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+@serialized_write
+def heartbeat_maintenance_run(run_id, root=None):
+    connection = _ensure_ltm_store(root, recover_indexes=False)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = _require_maintenance_run(connection, run_id)
+        now = _now()
+        connection.execute(
+            "UPDATE maintenance_runtime_state SET run_owner_pid=?, run_heartbeat_at=?, updated_at=? WHERE state_id=1",
+            (os.getpid(), now, now),
+        )
+        connection.commit()
+        return {"status": "alive", "run_id": run_id, "run_heartbeat_at": now}
     except Exception:
         connection.rollback()
         raise
@@ -1720,7 +1885,7 @@ def checkpoint_maintenance_run(run_id, next_plan_index, last_committed_plan_inde
             raise ValueError("maintenance checkpoint must be monotonic")
         if checkpoint > _latest_event_slot_seq(root):
             raise ValueError("maintenance checkpoint exceeds latest Event Stream slot")
-        connection.execute("UPDATE maintenance_runtime_state SET next_plan_index=?, last_committed_plan_index=?, last_checkpoint_slot_seq=?, updated_at=? WHERE state_id=1", (next_plan_index, committed, checkpoint, _now()))
+        connection.execute("UPDATE maintenance_runtime_state SET next_plan_index=?, last_committed_plan_index=?, last_checkpoint_slot_seq=?, run_heartbeat_at=?, updated_at=? WHERE state_id=1", (next_plan_index, committed, checkpoint, _now(), _now()))
         connection.commit()
         return {"status": "checkpointed", "run_id": run_id, "state": get_maintenance_runtime_state(root)}
     except Exception:
@@ -1740,7 +1905,7 @@ def advance_maintenance_coverage(run_id, end_slot_seq, root=None):
         latest = _latest_event_slot_seq(root)
         if end_slot_seq < current or end_slot_seq > latest:
             raise ValueError("maintenance coverage must advance continuously within the Event Stream")
-        connection.execute("UPDATE maintenance_runtime_state SET maintenance_coverage_cursor=?, last_checkpoint_slot_seq=?, updated_at=? WHERE state_id=1", (end_slot_seq, end_slot_seq, _now()))
+        connection.execute("UPDATE maintenance_runtime_state SET maintenance_coverage_cursor=?, last_checkpoint_slot_seq=?, run_heartbeat_at=?, updated_at=? WHERE state_id=1", (end_slot_seq, end_slot_seq, _now(), _now()))
         connection.commit()
         return {"status": "advanced", "run_id": run_id, "maintenance_coverage_cursor": end_slot_seq}
     except Exception:
@@ -1760,7 +1925,7 @@ def record_maintenance_failure(run_id, slot_seq, reason, root=None):
         slot_seq = int(slot_seq)
         if slot_seq > _latest_event_slot_seq(root):
             raise ValueError("failure slot exceeds latest Event Stream slot")
-        connection.execute("UPDATE maintenance_runtime_state SET run_status='failed', last_failure_slot_seq=?, last_failure_reason=?, last_failure_at=?, updated_at=? WHERE state_id=1", (slot_seq, str(reason), _now(), _now()))
+        connection.execute("UPDATE maintenance_runtime_state SET run_status='failed', last_failure_slot_seq=?, last_failure_reason=?, last_failure_at=?, run_heartbeat_at=?, updated_at=? WHERE state_id=1", (slot_seq, str(reason), _now(), _now(), _now()))
         connection.commit()
         return {"status": "failed", "run_id": run_id, "slot_seq": slot_seq}
     except Exception:
@@ -1784,7 +1949,7 @@ def complete_maintenance_run(run_id, report, root=None):
             (run_id, row["run_started_at"] or now, now, int(report.get("start_cursor", start_cursor)), int(report.get("end_cursor", end_cursor)), str(report.get("coverage_status", "completed")), int(report.get("processed_slot_count", 0)), *[int(report.get(k, 0)) for k in ("plan_commit_count", "created_object_count", "created_link_count", "deactivated_link_count", "updated_title_count", "updated_summary_count", "supersedes_count", "contradiction_count")], report.get("failure_slot_seq"), report.get("failure_reason"), str(report.get("final_check_status", "passed")), str(report.get("semantic_digest_status", "missing")), report.get("semantic_digest_id"), int(report.get("semantic_digest_token_count", 0)), report.get("maintainable_frontier"), report.get("coverage_target_slot_seq")),
         )
         connection.execute("DELETE FROM maintenance_reports WHERE maintenance_run_id IN (SELECT maintenance_run_id FROM maintenance_reports ORDER BY finished_at DESC LIMIT -1 OFFSET 50)")
-        connection.execute("UPDATE maintenance_runtime_state SET active_run_id=NULL, run_status='idle', run_started_at=NULL, run_start_cursor=NULL, last_checkpoint_slot_seq=NULL, next_plan_index=0, last_committed_plan_index=NULL, last_failure_slot_seq=NULL, last_failure_reason=NULL, last_failure_at=NULL, updated_at=? WHERE state_id=1", (now,))
+        connection.execute("UPDATE maintenance_runtime_state SET active_run_id=NULL, run_status='idle', run_started_at=NULL, run_start_cursor=NULL, run_owner_pid=NULL, run_heartbeat_at=NULL, last_checkpoint_slot_seq=NULL, next_plan_index=0, last_committed_plan_index=NULL, last_failure_slot_seq=NULL, last_failure_reason=NULL, last_failure_at=NULL, updated_at=? WHERE state_id=1", (now,))
         connection.commit()
         return {"status": "completed", "run_id": run_id, "report": report}
     except Exception:

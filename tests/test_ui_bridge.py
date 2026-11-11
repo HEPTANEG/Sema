@@ -179,7 +179,7 @@ def test_ui_bridge_slash_execute_accepts_frontend_command_without_leading_slash(
     assert result["title"] == "Status"
 
 
-def test_ui_bridge_starts_automatic_maintenance_when_ltm_pressure_is_full(isolated_workspace, monkeypatch):
+def test_ui_bridge_delivers_user_input_at_full_ltm_pressure(isolated_workspace, monkeypatch):
     from memory_engine import event_stream
     from memory_engine.ltm import formation
     from persistence import session
@@ -192,36 +192,202 @@ def test_ui_bridge_starts_automatic_maintenance_when_ltm_pressure_is_full(isolat
     monkeypatch.setattr(formation, "maintainable_slot_frontier", lambda **_kwargs: 99)
     server = BridgeServer(input_stream=io.StringIO(), output_stream=io.StringIO())
     server.initialize({})
-    before_messages = list(server.messages)
-    monkeypatch.setattr(server, "_preflight_provider", lambda: (_ for _ in ()).throw(AssertionError("provider must not be called")))
-    monkeypatch.setattr(ui_bridge_server.agent, "answer_with_tools", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("agent must not run")))
-    started = threading.Event()
-    release = threading.Event()
-    finished = threading.Event()
-
-    def fake_maintenance(*_args, **_kwargs):
-        started.set()
-        release.wait(timeout=1)
-        finished.set()
-        return {"status": "completed"}
-
-    monkeypatch.setattr(ui_bridge_server, "run_ltm_maintenance", fake_maintenance)
+    monkeypatch.setattr(server, "_preflight_provider", lambda: server.runtime_state.update({"provider_preflight_ok": True}))
+    monkeypatch.setattr(ui_bridge_server, "load_model_config", lambda: {"supports_streaming": False})
+    called = []
+    monkeypatch.setattr(ui_bridge_server.agent, "answer_with_tools", lambda messages, *_args: called.append(messages))
 
     result = server.send_message({"prompt": "hello"})
-    assert started.wait(timeout=1)
+    assert result["ok"] is True
+    assert called
+    assert any(message.get("role") == "user" and message.get("content") == "hello" for message in server.messages)
+    assert session.load_last_session() == server.messages
+    assert any(item["method"] == "event.user_message" for item in read_json_lines(server.output_stream))
 
-    assert result["accepted"] is True
-    assert result["maintenance_started"] is True
-    assert result["pending_prompt"] == "hello"
-    assert server.messages == before_messages
-    assert session.load_last_session() == before_messages
-    assert not any(item["method"] == "event.user_message" for item in read_json_lines(server.output_stream))
 
-    second = server.send_message({"prompt": "again"})
-    assert second["maintenance_started"] is True
-    assert second["maintenance_already_running"] is True
-    release.set()
-    assert finished.wait(timeout=1)
+def test_sleep_control_is_dispatched_after_main_turn_releases_locks(isolated_workspace, monkeypatch):
+    from runtime.maintenance_sleep import MaintenanceControlRequested
+
+    server = BridgeServer(input_stream=io.StringIO(), output_stream=io.StringIO())
+    server.initialize({})
+    server.runtime_state["provider_preflight_ok"] = True
+    monkeypatch.setattr(ui_bridge_server, "load_model_config", lambda: {"supports_streaming": False})
+    monkeypatch.setattr(
+        ui_bridge_server.agent,
+        "answer_with_tools",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(MaintenanceControlRequested({"action": "sleep", "wake_prompt": "Continue the file study at section 8."})),
+    )
+    observed = []
+
+    def dispatch(action, parent_turn_id=None, parent_request_id=None):
+        observed.append((action, server.turn_lock.locked(), parent_turn_id, parent_request_id))
+
+    monkeypatch.setattr(server, "_dispatch_maintenance_control", dispatch)
+    result = server.send_message({"prompt": "continue"})
+
+    assert result["suspended"] is True
+    assert observed and observed[0][0]["action"] == "sleep"
+    assert observed[0][1] is False
+    assert any(message.get("role") == "user" and message.get("content") == "continue" for message in server.messages)
+
+
+def test_maintenance_failure_wake_reports_attempt_count_and_run_id(monkeypatch):
+    server = BridgeServer(input_stream=io.StringIO(), output_stream=io.StringIO())
+    server.runtime_state["maintenance_continuation"] = {
+        "status": "running",
+        "continuation_id": "cont-1",
+        "wake_prompt": "Continue at section 8.",
+        "failure_count": 0,
+        "run_id": "maintenance_run_1",
+    }
+    wakes = []
+    monkeypatch.setattr(server, "enqueue_wake", lambda *args, **kwargs: wakes.append((args, kwargs)) or True)
+
+    server._maintenance_continuation_failed("provider unavailable", "maintenance_run_1")
+    continuation = server.runtime_state["maintenance_continuation"]
+
+    assert continuation["status"] == "failed"
+    assert continuation["failure_count"] == 1
+    assert continuation["run_id"] == "maintenance_run_1"
+    assert wakes[0][0][1] == "maintenance_sleep_failed"
+    assert wakes[0][0][2]["wake_prompt"] == "Continue at section 8."
+    assert wakes[0][0][2]["failure_count"] == 1
+
+
+def test_user_cannot_race_a_pending_maintenance_resume_wake(isolated_workspace):
+    server = BridgeServer(input_stream=io.StringIO(), output_stream=io.StringIO())
+    server.initialize({})
+    server.runtime_state["maintenance_continuation"] = {
+        "status": "running",
+        "continuation_id": "continuation-1",
+        "wake_prompt": "Continue at section 8.",
+    }
+
+    with pytest.raises(ui_bridge_server.JsonRpcError, match="task is paused"):
+        server.send_message({"prompt": "new user input"})
+
+
+def test_wake_delivery_deferral_has_a_reason_and_retry_count():
+    from runtime.wake import wake_event
+
+    server = BridgeServer(input_stream=io.StringIO(), output_stream=io.StringIO())
+    server._pending_message_responses = 1
+    event = wake_event("maintainer", "maintenance_task_resumed", {})
+
+    assert server._deliver_wake(event) is False
+    assert event.last_delivery_status == "deferred"
+    assert event.last_delivery_reason == "pending message response"
+
+
+def test_wake_delivery_retries_before_agent_loop_without_reappending_wake(monkeypatch):
+    from runtime.wake import wake_event
+
+    server = BridgeServer(input_stream=io.StringIO(), output_stream=io.StringIO())
+    server.messages = []
+    server._ensure_initialized = lambda: None
+    server._start_turn = lambda *_args, **_kwargs: None
+    server._finish_turn = lambda *_args, **_kwargs: None
+    sent_events = []
+    server.send_event = lambda event_type, *_args, **_kwargs: sent_events.append(event_type)
+    monkeypatch.setattr(ui_bridge_server, "get_project_info", lambda: {"root": "test-root"})
+
+    class Phase:
+        def acquire_main(self):
+            return True
+
+        def release_main(self):
+            return None
+
+    monkeypatch.setattr(ui_bridge_server, "get_agent_phase", lambda *_args: Phase())
+    attempts = []
+
+    def run_turn(*_args, on_message_persisted=None, message_already_persisted=False, on_agent_loop_started=None, **_kwargs):
+        attempts.append(message_already_persisted)
+        if len(attempts) == 1:
+            on_message_persisted()
+            raise RuntimeError("preflight failed before the Main-Agent loop started")
+        on_agent_loop_started()
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "_run_message_turn", run_turn)
+    event = wake_event(
+        "maintainer",
+        "maintenance_task_resumed",
+        {"continuation_id": "cont-1", "maintenance_run_id": "run-1"},
+    )
+
+    assert server._deliver_wake(event) is False
+    assert event.message_persisted is True
+    assert event.main_agent_started is False
+    assert server._deliver_wake(event) is True
+    assert attempts == [False, True]
+    assert sent_events.count("wake_delivered") == 1
+    assert event.main_agent_started is True
+    assert server.runtime_state["maintenance_continuation"]["status"] == "resuming"
+
+
+def test_wake_announcement_failure_retries_same_persisted_message(monkeypatch):
+    from runtime.wake import wake_event
+
+    server = BridgeServer(input_stream=io.StringIO(), output_stream=io.StringIO())
+    server.messages = []
+    server._ensure_initialized = lambda: None
+    server._start_turn = lambda *_args, **_kwargs: None
+    server._finish_turn = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(ui_bridge_server, "get_project_info", lambda: {"root": "test-root"})
+
+    class Phase:
+        def acquire_main(self):
+            return True
+
+        def release_main(self):
+            return None
+
+    monkeypatch.setattr(ui_bridge_server, "get_agent_phase", lambda *_args: Phase())
+    announcements = []
+    agent_starts = []
+
+    def send_event(event_type, *_args, **_kwargs):
+        if event_type == "wake_delivered":
+            announcements.append(1)
+            if len(announcements) == 1:
+                raise RuntimeError("temporary transport failure")
+
+    server.send_event = send_event
+
+    def run_turn(*_args, on_message_persisted=None, message_already_persisted=False, on_agent_loop_started=None, **_kwargs):
+        if not message_already_persisted:
+            on_message_persisted()
+            return {"ok": True}
+        on_agent_loop_started()
+        agent_starts.append(1)
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "_run_message_turn", run_turn)
+    event = wake_event("maintainer", "maintenance_task_resumed", {"continuation_id": "cont-2"})
+
+    assert server._deliver_wake(event) is False
+    assert event.message_persisted is True
+    assert event.wake_announced is False
+    assert server._deliver_wake(event) is True
+    assert event.wake_announced is True
+    assert announcements == [1, 1]
+    assert agent_starts == [1]
+
+
+def test_sleep_continuation_retains_remote_request_provenance(monkeypatch):
+    server = BridgeServer(input_stream=io.StringIO(), output_stream=io.StringIO())
+    monkeypatch.setattr(server, "_start_maintenance_continuation", lambda: True)
+
+    server._dispatch_maintenance_control(
+        {"action": "sleep", "wake_prompt": "Continue at section 8."},
+        "turn-1",
+        "request-1",
+    )
+
+    continuation = server.runtime_state["maintenance_continuation"]
+    assert continuation["parent_turn_id"] == "turn-1"
+    assert continuation["parent_request_id"] == "request-1"
 
 
 def test_ui_bridge_allows_ltm_maintain_slash_when_ltm_pressure_is_full(isolated_workspace, monkeypatch):

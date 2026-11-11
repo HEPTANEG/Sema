@@ -12,7 +12,7 @@ import memory_engine.wm.working_memory as working_memory
 EXPECTED_WM_API = {
     "working_memory_status": "(messages=None, runtime_state=None)",
     "run_working_memory_maintenance": "(messages=None, force=False, runtime_state=None)",
-    "run_preflight_working_memory_recovery": "(messages=None, error=None, runtime_state=None)",
+    "compact_exact_slot": "(slot_seq, runtime_state=None)",
     "format_working_memory_status": "(status)",
     "format_working_memory_run": "(result)",
 }

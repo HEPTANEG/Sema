@@ -292,6 +292,9 @@ TOOL_DEFINITIONS = [
         ["instruction"],
         "memory_write",
     ),
+    _tool("sleep_for_maintenance", "Pause this task for LTM maintenance. Available only from pressure 0.5. Provide a wake_prompt containing the goal, exact progress, and next step. This must be the response's only tool call.", {"wake_prompt": _string_property("Required task continuation pointer: goal, exact progress, and next action after maintenance.")}, ["wake_prompt"], "runtime_state", expose_to_model=False),
+    _tool("retry_ltm_maintenance", "Retry the suspended LTM maintenance run, reusing its wake_prompt and run ID.", {}, [], "runtime_state", expose_to_model=False),
+    _tool("return_maintenance_failure", "Explain the maintenance failure to the user and keep the original task paused.", {"message": _string_property("Concise user-facing explanation of the maintenance failure and next options.")}, ["message"], "runtime_state", expose_to_model=False),
 ]
 
 

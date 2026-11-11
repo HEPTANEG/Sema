@@ -123,6 +123,38 @@ describe('createGatewayEventHandler', () => {
     expect(getLtmMaintenanceState().historyItems[0]).toMatchObject({kind: 'slash', text: '/memory ltm maintain'})
   })
 
+  it('closes the maintenance view when a task-resume wake is delivered', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    openLtmMaintenanceView('/memory ltm maintain')
+    patchUiState({ busy: false, status: 'LTM Maintenance completed' })
+
+    onEvent({
+      payload: { kind: 'maintenance_task_resumed', source: 'maintainer', wake_id: 'wake-1' },
+      type: 'wake_delivered'
+    } as any)
+
+    expect(getLtmMaintenanceState().active).toBe(false)
+    expect(getUiState().busy).toBe(true)
+    expect(getUiState().status).toBe('resuming task after LTM maintenance…')
+  })
+
+  it('returns to Main Agent when a maintenance-failure wake is delivered', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    openLtmMaintenanceView('/memory ltm maintain')
+    patchUiState({ busy: false, status: 'LTM Maintenance failed' })
+
+    onEvent({
+      payload: { kind: 'maintenance_sleep_failed', source: 'maintainer', wake_id: 'wake-failed-1' },
+      type: 'wake_delivered'
+    } as any)
+
+    expect(getLtmMaintenanceState().active).toBe(false)
+    expect(getUiState().busy).toBe(true)
+    expect(getUiState().status).toBe('handling LTM maintenance failure…')
+  })
+
   it('shows the first rejected LTM maintenance plan error in the tool summary', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

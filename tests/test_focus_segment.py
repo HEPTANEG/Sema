@@ -35,7 +35,7 @@ def _projection_with_omitted(start, end):
         "messages": [_message("system", "system"), _message("user", "latest user")],
         "budget": 10000,
         "selected_tokens": 10,
-        "selected_blocks": [
+        "selected_units": [
             {
                 "kind": "interaction",
                 "messages": [_message("user", "latest user")],
@@ -45,7 +45,7 @@ def _projection_with_omitted(start, end):
                 "token_count": 10,
             }
         ],
-        "omitted_blocks": [
+        "omitted_units": [
             {
                 "kind": "interaction",
                 "start_index": start,
@@ -62,7 +62,7 @@ def _projection_without_omitted():
         "messages": _messages(),
         "budget": 10000,
         "selected_tokens": 10,
-        "selected_blocks": [
+        "selected_units": [
             {
                 "kind": "interaction",
                 "messages": _messages()[1:],
@@ -72,7 +72,7 @@ def _projection_without_omitted():
                 "token_count": 10,
             }
         ],
-        "omitted_blocks": [],
+        "omitted_units": [],
     }
 
 
@@ -595,7 +595,7 @@ def test_segment_ingest_resolved_gate_uses_evidence_module(isolated_workspace, m
             "ok": True,
             "query": {"type": "stm_evidence", "budget": 10000},
             "selected_tokens": 10,
-            "selected_block_count": 1,
+            "selected_unit_count": 1,
             "content_preview": "recent evidence",
             "truncated": False,
             "errors": [],

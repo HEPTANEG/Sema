@@ -1,314 +1,211 @@
-# Context Builder And Context Budget
+# Context Builder And Context Capacity
 
-This document describes the implemented Event Stream provider-context assembly
-and Dynamic Context Budget. STM projection and its one-way WM ingress boundary
-are defined in [Short-Term Memory](stm.md). Working Memory compression and
-preflight recovery are defined in [Working Memory](wm.md).
+Context Builder assembles the Main Agent provider context from Event Stream
+projections. Capacity Planner computes structural STM and WM requirements before
+state is committed. STM selection is defined in [Short-Term Memory](stm.md),
+and WM compression and pins are defined in [Working Memory](wm.md).
 
-The implemented Event Stream context stack is:
+## Provider Order
 
-```text
-system prompt
-LTM  omitted in V1
-WM   Focus-aware working-memory projection
-STM  latest complete raw interaction blocks
-```
-
-The goal is to keep recent work high fidelity and inject compact older active
-trunk material when useful. See [Short-Term Memory](stm.md) for STM selection,
-watermark, evidence, and status contracts.
-
-## Context Builder
-
-Context Builder is the Event Stream provider-context assembly layer.
-
-Provider order:
+The provider-visible order is:
 
 ```text
 system prompt
-LTM: omitted in V1 when empty
-WM: Focus-aware working-memory projection
-STM: latest complete raw interaction blocks
+WM: Focus-aware timeline, including an optional current-turn pin
+LTM: automatic Memory Push content when available
+STM: continuous newest suffix of raw projection units
 ```
 
-WM projection format:
+Leading system messages remain outside the STM budget. WM uses active Event
+Stream representations, while STM uses immutable original messages.
+
+## WM Projection
+
+When Focus state exists, WM renders resolved titles, inactive summaries,
+active metadata and details, and bounded unowned details. Without Focus state,
+it renders a chronological active-trunk suffix. The complete rendered
+`<working-memory>` wrapper counts against the WM budget.
+
+The optional current-turn user pin is rendered before ordinary WM details and
+shares the same budget. Its source slot is removed from ordinary WM candidates
+to prevent duplicate context.
+
+WM selects recent details under its budget; it does not require the whole WM
+window to fit. `WM_required` includes only the minimum valid projection:
 
 ```text
-<working-memory>
-Resolved:
-- Completed topic
-
-Inactive:
-- Parked topic: compact summary
-
-Active:
-Current topic: current summary
-[42] user: ...
-[43] sema: ...
-</working-memory>
+minimum WM wrapper
++ current-turn pin, when active
++ newest eligible WM record
++ mandatory Focus metadata
 ```
-
-The projection separates logical WM residency from prompt injection. Focus
-assignment rows and segment ranges determine which slots remain logically
-resident. The dynamic WM budget, normally between 10,000 and 50,000 tokens,
-limits the final rendered `<working-memory>` text rather than the raw tokens of
-all resident slots.
-
-WM selection:
-
-- load all non-system active-trunk records before the first STM selected slot;
-- render detailed records only for active Focus segments;
-- render inactive segments as title and summary, and resolved segments as title
-  only;
-- reserve at most 20 percent of the WM budget, capped at 10,000 tokens, for
-  Focus metadata, with active metadata ahead of inactive and resolved metadata;
-- reserve up to 10 percent of the detail pool for recent audited-unassigned and
-  unaudited unowned records, returning unused capacity to active details;
-- pack detail candidates newest first, then render selected records in slot
-  order;
-- truncate an oversized inactive summary only in the rendered projection;
-- fail with the existing oversized-WM error only when the newest active detail
-  and required metadata cannot fit.
-
-When Focus state exists but the active segment has no ranges, Context Builder
-still renders bounded Focus metadata and unowned context. It uses the legacy raw
-timeline suffix only when no Focus state exists. Online Formation and Formation
-Backfill continue to use the raw suffix selector, so Focus-aware prompt
-projection does not change Formation latency or coverage boundaries.
-
-Projection status reports injected and resident state independently.
-`selected_records` and `selected_slot_seqs` identify records whose details were
-actually injected, while `selected_tokens` counts the complete rendered WM
-text. `resident_slot_count` and `resident_raw_token_count` describe logical WM
-residency even when inactive or resolved records are represented only by
-metadata.
-
-Recovery rule:
-
-- Normal successful context builds do not run synchronous WM maintenance.
-- Large file reads should be bounded before they enter STM. The `read_file`
-  tool returns `ok`, `warn_large`, or `too_large` and recommends ranged reads or
-  `get_overview` for large files; this is the primary guard for the known
-  all-or-nothing file-ingress failure mode.
-- If context build fails because the latest STM block or one WM slot exceeds
-  the current dynamic budget, Sema first saturates the failed target budget to
-  its max and rebuilds once if the content can fit inside that max.
-- If the failed content still exceeds the target max budget, Sema runs one
-  Working Memory maintenance pass before the provider call.
-- After the optional preflight pass, Context Builder rebuilds provider context
-  once.
-- If context build still fails, Sema returns the existing clear context build
-  error.
-
-Typical SUM use cases:
-
-- long assistant answer whose exact wording is no longer needed.
-- long tool output.
-- pasted logs.
-- PDF / file content preview.
-- large HTML or rich text content.
-
-Debug commands:
-
-```text
-/memory context status
-/memory budget status
-/memory budget set stm <tokens>
-/memory budget set wm <tokens>
-/memory budget set both <tokens>
-/memory budget reset
-```
-
-Status output is metadata-only. It reports budget source, STM/WM budget ranges,
-raw budgets, stable/effective budgets, watermark metadata, context pressure
-subscores, selected token counts, and selection counts. It does not show
-message bodies.
 
 ## Dynamic Context Budget
 
-Dynamic Context Budget is the deterministic pressure model that controls STM
-and WM budgets in Event Stream mode. The implementation is in
-`memory_engine.dynamic_context_budget`.
+Dynamic Context Budget computes formula budgets from interaction continuity
+`I`, execution state `S`, and token load `L`. Default ranges are 1,000 to
+50,000 tokens for both STM and WM. Project-local manual overrides change the
+maximum, not the current fixed budget.
 
-### Inputs
-
-The model uses these runtime signals:
-
-- recent user-turn count and continuous-session duration;
-- the latest user-to-user gap;
-- tool-call count in the current Main Agent run;
-- continuous-session token totals, average, and maximum from original Event
-  Stream event token counts;
-- token count of the latest user message;
-- context-build failure feedback for the current provider-context attempt.
-
-Tool failures, repeated commands, and error-message counts are not inputs to
-the budget formula. The assistant-to-user gap is also excluded.
-
-A continuous session is formed by walking backward through non-system Event
-Stream slots while each adjacent gap is at most 600 seconds. Its total duration
-can therefore exceed 600 seconds.
-
-### Pressure Model
-
-The model uses saturating and decay curves:
-
-$$
-g(x,\tau) = 1 - e^{-x/\tau},
-\qquad
-d(x,\tau) = e^{-x/\tau}
-$$
-
-Interaction continuity is:
-
-$$
-\begin{aligned}
-I &= 0.30 f_{\mathrm{turns}}
-  + 0.30 f_{\mathrm{session}}
-  + 0.40 f_{\mathrm{user\_gap}} \\
-f_{\mathrm{turns}} &= g(n,4) \\
-f_{\mathrm{session}} &= g(d,1200) \\
-f_{\mathrm{user\_gap}} &= d(g_u,600)
-\end{aligned}
-$$
-
-Here, `n` is the recent user-turn count, `d` is continuous-session duration
-in seconds, and `g_u` is the latest gap from the previous user turn to the
-current user turn. It is not averaged.
-
-State pressure is based on recent execution activity:
-
-$$
-\begin{aligned}
-S &= f_{\mathrm{activity}} \\
-f_{\mathrm{activity}} &= g(a,4) \\
-a &= \mathrm{tool\_count}
-\end{aligned}
-$$
-
-Continuous-session token load is:
-
-$$
-\begin{aligned}
-L &= 0.15 f_{\mathrm{token\_total}}
-  + 0.30 f_{\mathrm{token\_average}}
-  + 0.15 f_{\mathrm{token\_max}}
-  + 0.40 f_{\mathrm{current\_user}} \\
-f_{\mathrm{token\_total}} &= g(T,20000) \\
-f_{\mathrm{token\_average}} &= g(A,4000) \\
-f_{\mathrm{token\_max}} &= g(M,10000) \\
-f_{\mathrm{current\_user}} &= g(U,4000)
-\end{aligned}
-$$
-
-`T`, `A`, and `M` are the total, average, and maximum original event token
-counts in the continuous session. `U` is the token count of the latest user
-message. That message is also represented separately in `L` after it has
-been persisted into the Event Stream.
-
-The normal pressure and budget factors are:
-
-$$
-\begin{aligned}
-F_{\mathrm{STM}} &= 0.40I + 0.20S + 0.40L \\
-F_{\mathrm{WM}} &= \max(I,S,L) \\
-P_{\mathrm{context}} &= F_{\mathrm{STM}}
-\end{aligned}
-$$
-
-Context-build failure remains a separate reactive override, not a normal
-predictive score.
-
-### Budget Mapping
-
-The default runtime ranges are:
+### Interaction Continuity
 
 ```text
-STM: 1000..50000 tokens
-WM:  1000..50000 tokens
+f_turns    = 1 - exp(-recent_turn_count / 4)
+f_session  = 1 - exp(-continuous_session_duration_seconds / 1200)
+f_user_gap = exp(-user_gap_seconds / 600)
+
+I = 0.30 f_turns + 0.30 f_session + 0.40 f_user_gap
 ```
 
-$$
-\begin{aligned}
-\mathrm{STM}_{\mathrm{raw}} &= \mathrm{STM}_{\min}
-  + F_{\mathrm{STM}}(\mathrm{STM}_{\max}-\mathrm{STM}_{\min}) \\
-\mathrm{WM}_{\mathrm{raw}} &= \mathrm{WM}_{\min}
-  + F_{\mathrm{WM}}(\mathrm{WM}_{\max}-\mathrm{WM}_{\min})
-\end{aligned}
-$$
+`user_gap_seconds` is the latest external user-to-user gap. A missing gap
+contributes zero. The assistant gap is not an input.
 
-Manual budget overrides are project-local maximum limits, not fixed budgets.
-Each STM or WM maximum may be set between 2000 and 200000 tokens. The dynamic
-formula runs inside the resulting effective range:
+### Execution State
 
-$$
-\mathrm{effective\_min} =
-\min(\mathrm{default\_min},\mathrm{manual\_max\_override})
-$$
+```text
+f_activity = 1 - exp(-recent_tool_count / 4)
+f_failure  = 1 - exp(-continuous_session_context_budget_failure_count / 2)
 
-### Context-Build Failure Pressure
+S = 1 - (1 - f_activity)(1 - f_failure)
+```
 
-Context-build failure is reactive feedback, not a normal predictive signal. For
-the failed target:
+A budget failure means structural required capacity exceeded the capacity
+already covered by the current formula and Stabilizer state. It does not mean
+provider context ultimately failed. STM and WM share one counter; if either or
+both trigger a floor in one real Context Build, the counter increments once.
+The new count affects `S` beginning with the next build.
 
-$$
-\mathrm{context\_build\_failure}=1
-\quad\Longrightarrow\quad
-P_{\mathrm{context}}=1
-$$
+The counter resets when the continuous session key changes. This reset does not
+reset Stabilizer budgets.
 
-If the failed target is STM, `F_STM` is set to 1. If it is WM, `F_WM` is set
-to 1. The failed target therefore uses its effective maximum for the rebuild.
-If the required content still exceeds that maximum, one Preflight Working
-Memory Recovery pass runs before one rebuild.
+### Token Load
 
-### Budget Stabilizer
+```text
+f_total   = 1 - exp(-recent_session_token_total / 20000)
+f_average = 1 - exp(-recent_session_token_average / 4000)
+f_max     = 1 - exp(-recent_session_token_max / 10000)
+f_current = 1 - exp(-current_user_message_tokens / 4000)
 
-The stabilizer tracks `context_build_seq` for every provider context build,
-including internal ReAct and tool-call steps. For a budget target with a prior
-stable value `B_{\mathrm{prev}}` and raw value `B_{\mathrm{raw}}`:
+L = 0.15 f_total + 0.30 f_average + 0.15 f_max + 0.40 f_current
+```
 
-$$
-B_{\mathrm{stable}} =
-\begin{cases}
-B_{\mathrm{raw}} & B_{\mathrm{raw}} > B_{\mathrm{prev}} \\
-B_{\mathrm{prev}} & \text{during a hold or inside the 10\% deadband} \\
-\max(B_{\mathrm{raw}},\,0.80B_{\mathrm{prev}}) & \text{otherwise}
-\end{cases}
-$$
+Continuous-session token statistics use original Event Stream event tokens.
+The current external user message is already persisted before this calculation.
 
-When the raw budget reaches at least 80% of its effective maximum, the target
-is held for three context-build steps. A context-build failure holds the failed
-target at its effective maximum for five steps. The stabilizer is applied after
-the raw dynamic budget and manual maximum override are calculated.
+### Target Factors
 
-Dynamic Context Budget does not use LLMs, embeddings, semantic retrieval,
-graph traversal, or output-budget control. Its pressure result is process-local;
-stabilizer and manual maximum state are project-local runtime state.
+```text
+F_STM = 0.35 I + 0.30 S + 0.35 L
+F_WM  = max(I, S, L)
+```
 
-## Design Validation
+Formula budgets map each factor linearly into its effective configured range.
+Tool failures, repeated commands, textual error matching, test commands, edit
+counts, retry phrases, and assistant response delay are not budget inputs.
 
-The implementation and tests cover:
+## Structural Requirements
 
-- sporadic simple questions;
-- continuous sessions with short current inputs;
-- tool activity and current-input token load;
-- empty signal values and the 1000-token minimum;
-- the distinct STM weighted-sum and WM maximum aggregations;
-- context-build failure forcing only its target to the effective maximum;
-- Stabilizer upward, hold, deadband, and downward behavior.
+Formula budgets are not sufficient by themselves because provider-valid units
+must fit whole.
 
-The resulting boundaries are:
+```text
+STM_required  = rendered tokens of the newest eligible STM atomic unit
+STM_candidate = max(STM_base, STM_required)
 
-- zero-valued signals map both budgets to their 1000-token minimum;
-- STM responds to all three scores through its weighted sum;
-- WM follows its highest score, so any one dominant signal can raise WM;
-- current user input contributes separately to `L`, in addition to its
-  inclusion in persisted continuous-session token statistics;
-- context-build failure saturates only the failed target and invokes preflight
-  recovery only when the effective maximum remains insufficient;
-- Budget Stabilizer prevents rapid downward oscillation while allowing an
-  immediate upward response.
+WM_required   = rendered tokens of the minimum valid WM projection
+WM_candidate  = max(WM_base, WM_required)
+```
 
-Runtime defaults are `1000..50000` tokens for both STM and WM; manual maximum
-overrides may change the effective ranges.
+Required floors participate in normal stabilization. The persisted stable
+budget covers the same continuing requirement on later builds, so one
+persistent requirement does not repeatedly increment the failure counter.
+
+## Capacity Planner Sequence
+
+One real Main Agent provider build performs this sequence:
+
+1. Read the current continuous-session failure count and Stabilizer state.
+2. Compute `I`, `S`, `L`, `STM_base`, and `WM_base`.
+3. Measure `STM_required`, preview the STM candidate, and build STM.
+4. Derive the current-turn pin from that same STM projection.
+5. Measure `WM_required` from the resulting boundary.
+6. If WM exceeds maximum, perform at most one exact-slot recovery and measure
+   once more.
+7. Determine one shared failure outcome.
+8. Persist failure count, `context_build_seq`, and both stabilized budgets in
+   one Stabilizer-state write.
+9. Stage the STM-to-WM watermark and persist the current-turn pin.
+
+Observer, Evidence, status commands, and outbound capacity checks run the same
+planning logic without incrementing sequence or failure count, saving
+Stabilizer state, staging a watermark, creating a pin, or compacting WM.
+
+## Budget Stabilizer
+
+For a candidate budget `B_raw` and prior stable budget `B_prev`:
+
+```text
+B_raw > B_prev
+    rise immediately
+
+inside an active hold or within a 10% deadband
+    retain B_prev
+
+otherwise
+    max(B_raw, 0.80 * B_prev)
+```
+
+Reaching at least 80% of an effective maximum starts a three-build hold. There
+is no failure-specific maximum saturation or failure hold. Session reset clears
+the shared failure counter but does not reset Stabilizer state.
+
+## Above-Maximum Behavior
+
+- A current external user instruction whose newest STM unit exceeds the STM
+  maximum returns a typed `too_large` capacity error. The provider is not
+  called and the instruction is not silently summarized.
+- Main Agent tool results are guarded before Event Stream append. Full output
+  becomes a durable artifact and active history receives a bounded envelope.
+- An oversized WM RAW/ref receives one exact-slot SUM attempt. If no usable SUM
+  results, a bounded active REF replaces the active representation while the
+  immutable original remains available.
+- An oversized pin is removed rather than summarized; its source then follows
+  ordinary WM handling.
+
+Model-generated oversized assistant text and oversized tool-call arguments are
+outside the current guard.
+
+## Removed Failure Retry
+
+Context construction no longer parses exception strings, writes transient
+`context_build_failure` runtime state, forces a target to maximum after an
+exception, runs top-three interaction-block Preflight Recovery, or rebuilds
+Context automatically. Exact-slot WM recovery is proactive planning, not an
+exception retry.
+
+## Observability
+
+Metadata-only status surfaces expose:
+
+```text
+continuous_session_context_budget_failure_count
+f_failure
+
+stm_base_budget
+stm_required_tokens
+stm_candidate_budget
+stm_effective_budget
+stm_floor_applied
+
+wm_base_budget
+wm_required_tokens
+wm_candidate_budget
+wm_effective_budget
+wm_floor_applied
+
+capacity_plan
+capacity_recovery_action
+```
+
+They also report pin source/token metadata, selection ranges, watermark state,
+and Stabilizer sequence without exposing omitted message bodies.

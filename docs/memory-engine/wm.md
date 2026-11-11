@@ -77,42 +77,38 @@ audit row under the Memory Engine observer data. The audit includes query
 metadata such as query type, projection, range, max preview size, result count,
 error count, and `read_only=true`; it does not persist to Event Stream.
 
-## Maintenance And Recovery
+## Maintenance And Capacity Recovery
 
-Normal WM maintenance runs after final answers when STM has omitted blocks.
+Normal WM maintenance runs after final answers when STM has omitted units.
 Each maintenance trigger processes all current candidates serially. It does not
 send parallel provider requests in V1.
 
-Preflight Working Memory Recovery runs before a provider call only when context
-construction cannot fit the failed target even after the target budget is
-saturated to its effective maximum. It uses the same RAW -> SUM pipeline, but
-candidate selection is intentionally more permissive for the failed target:
+Capacity Planner measures the minimum valid WM projection before provider
+assembly. When the newest required RAW/ref record exceeds the configured WM
+maximum, it may run one exact-slot compaction attempt against that record. A
+successful SUM is measured once more. A `keep_raw`, missing candidate, or
+internal-model failure creates a bounded active REF that preserves the
+immutable original event and exposes bounded retrieval guidance. Recovery does
+not process an interaction block, select unrelated large slots, or rebuild the
+entire Context after an exception.
 
-- prior `kept_raw` slots may be reprocessed if they are inside the failed
-  target;
-- already summarized slots are not reprocessed;
-- active SUM events are never touched;
-- an oversized latest STM block first uses normal eligible candidates plus
-  `kept_raw` overrides;
-- if that produces no candidates, preflight selects up to three largest active
-  RAW/ref non-system slots in the failed block, even below the normal
-  400-token threshold;
-- an oversized WM slot retries the exact failed slot when it is active RAW/ref,
-  including prior `kept_raw` state; and
-- block-level SUM is not allowed.
+## Current-Turn Pin
 
-After preflight recovery, Context Builder rebuilds provider context once. If
-context construction still fails, Sema returns the existing clear context build
-error.
-
-Preflight result metadata is debug-only and provider-invisible:
+WM has one deterministic current-turn external-user pin. When the latest
+external user slot leaves the current STM projection, the pin references that
+slot's immutable original event. It renders before ordinary WM details as:
 
 ```text
-candidate_policy
-preflight_target
-reprocessed_slot_seqs
-fallback_candidate_count
+Pinned current-turn user instruction (this might be important for completing the current task):
+[slot <source_slot_seq>] <original content>
 ```
+
+The pin counts against the normal WM budget and is deduplicated from the
+ordinary WM record for the same slot. It is cleared when the next external user
+message is persisted. Runtime-originated `user` messages do not create or
+clear it. If the pin itself exceeds WM maximum, it is removed and its source
+continues through ordinary WM oversized-record handling; no pin summary is
+created.
 
 ## Handoffs
 
@@ -148,7 +144,7 @@ Primary implementation entrypoints:
 ```text
 working_memory_status(messages=None, runtime_state=None)
 run_working_memory_maintenance(messages=None, force=False, runtime_state=None)
-run_preflight_working_memory_recovery(messages=None, error=None, runtime_state=None)
+compact_exact_slot(slot_seq, runtime_state=None)
 format_working_memory_status(status)
 format_working_memory_run(result)
 ```
@@ -168,9 +164,11 @@ not show message bodies.
 ## Implementation Map
 
 - `memory_engine.wm.working_memory` owns candidate selection, Maintainer calls,
-  SUM creation, persistent WM slot state, status, manual runs, and preflight
+  SUM creation, persistent WM slot state, status, manual runs, and exact-slot
   recovery. The package entrypoint `memory_engine.wm` re-exports the formal WM
   operations.
+- `memory_engine.wm.pins` owns current-turn pin persistence, derivation, and
+  immutable-original rendering.
 - `memory_engine.event_stream` stores RAW/ref/SUM events, active/original
   projection state, and immutable artifacts.
 - `memory_engine.evidence` provides bounded read-only evidence lookup for

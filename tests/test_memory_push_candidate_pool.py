@@ -1,5 +1,7 @@
 import json
 
+import time
+
 
 def _model_response(content):
     return {"choices": [{"message": {"content": content}}]}
@@ -273,4 +275,23 @@ def test_candidate_pool_returns_empty_when_all_queries_fail(monkeypatch):
 
     assert result["status"] == "error"
     assert result["items"] == []
+    assert result["errors"]
+
+
+def test_candidate_pool_does_not_wait_for_semantic_future_after_deadline(monkeypatch):
+    import memory_engine.ltm.candidate_generation as generation
+
+    def slow_semantic_batch(*_args):
+        time.sleep(0.25)
+        return []
+
+    monkeypatch.setattr(generation, "_run_semantic_batch", slow_semantic_batch)
+    started = time.monotonic()
+    result = generation.build_candidate_pool(
+        [{"query": "query", "services": ["embedding"]}],
+        deadline=started + 0.05,
+    )
+
+    assert time.monotonic() - started < 0.2
+    assert result["status"] == "error"
     assert result["errors"]

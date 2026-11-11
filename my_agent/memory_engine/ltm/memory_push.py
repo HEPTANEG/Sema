@@ -7,7 +7,7 @@ from . import candidate_generation
 CHANNEL_ORDER = ("general_semantic", "latest_semantic", "entity")
 
 
-def build_candidate_pool(compiled_queries, *, profile=None, root=None, _diagnostic_profiler=None):
+def build_candidate_pool(compiled_queries, *, profile=None, root=None, _diagnostic_profiler=None, deadline=None):
     """Thin Push wrapper around the neutral Candidate Generation core.
 
     Push still owns channel compilation, routing, caching, and its historical
@@ -34,7 +34,7 @@ def build_candidate_pool(compiled_queries, *, profile=None, root=None, _diagnost
                     "lexical": channel == "entity",
                 })
     result = candidate_generation.build_candidate_pool(
-        hypotheses, profile=profile, root=root, diagnostic_profiler=_diagnostic_profiler,
+        hypotheses, profile=profile, root=root, diagnostic_profiler=_diagnostic_profiler, deadline=deadline,
     )
     result["items"] = [item for item in result.get("items", [])
                        if (item.get("strength") or 0) >= ltm_store.PUSH_STRENGTH_THRESHOLD]

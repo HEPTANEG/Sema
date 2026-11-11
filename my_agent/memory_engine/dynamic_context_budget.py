@@ -34,7 +34,12 @@ def collect_context_pressure_signals(messages, runtime_state):
     last_run = runtime_state.get("last_run") if isinstance(runtime_state.get("last_run"), list) else []
     recent_tool_count = _recent_tool_count(last_run)
     token_stats = _continuous_session_token_stats()
-    failure = runtime_state.get("context_build_failure") if isinstance(runtime_state.get("context_build_failure"), dict) else {}
+    session_key = str(temporal.get("continuous_session_started_at") or "")
+    try:
+        from .budget_stabilizer import context_budget_failure_count
+        failure_count = context_budget_failure_count(session_key)
+    except Exception:
+        failure_count = 0
     return {
         "recent_tool_count": recent_tool_count,
         "recent_turn_count": int(temporal.get("recent_turn_count") or 0),
@@ -44,10 +49,8 @@ def collect_context_pressure_signals(messages, runtime_state):
         "recent_session_token_average": int(token_stats.get("recent_session_token_average") or 0),
         "recent_session_token_max": int(token_stats.get("recent_session_token_max") or 0),
         "current_user_message_tokens": _current_user_message_tokens(messages),
-        "context_build_failure": 1.0 if failure else 0.0,
-        "failure_target": failure.get("target") or "",
-        "failure_required_tokens": int(failure.get("required_tokens") or 0),
-        "failure_failed_budget": int(failure.get("failed_budget") or 0),
+        "continuous_session_context_budget_failure_count": failure_count,
+        "continuous_session_key": session_key,
     }
 
 
@@ -70,7 +73,8 @@ def compute_dynamic_context_budget(signals, ranges=None):
 
     activity = int(signals.get("recent_tool_count") or 0)
     f_activity = _saturating(activity, TAU_ACTIVITY)
-    state = f_activity
+    f_failure = _saturating(signals.get("continuous_session_context_budget_failure_count"), 2)
+    state = 1.0 - (1.0 - f_activity) * (1.0 - f_failure)
 
     f_token_total = _saturating(signals.get("recent_session_token_total"), TAU_TOKEN_TOTAL)
     f_token_average = _saturating(signals.get("recent_session_token_average"), TAU_TOKEN_AVERAGE)
@@ -83,19 +87,9 @@ def compute_dynamic_context_budget(signals, ranges=None):
         + 0.40 * f_current_user_input
     )
 
-    stm_factor = 0.40 * interaction + 0.20 * state + 0.40 * token_load
+    stm_factor = 0.35 * interaction + 0.30 * state + 0.35 * token_load
     wm_factor = max(interaction, state, token_load)
     pressure = stm_factor
-    failure_target = str(signals.get("failure_target") or "")
-    failure_budget_action = "none"
-    if signals.get("context_build_failure"):
-        pressure = 1.0
-        if failure_target == "stm":
-            stm_factor = 1.0
-            failure_budget_action = "force_stm_max"
-        elif failure_target == "wm":
-            wm_factor = 1.0
-            failure_budget_action = "force_wm_max"
     stm_budget = _budget(stm_min, stm_max, stm_factor)
     wm_budget = _budget(wm_min, wm_max, wm_factor)
     return {
@@ -106,6 +100,7 @@ def compute_dynamic_context_budget(signals, ranges=None):
             "f_session": _round(f_session),
             "f_user_gap": _round(f_user_gap),
             "f_activity": _round(f_activity),
+            "f_failure": _round(f_failure),
             "f_token_total": _round(f_token_total),
             "f_token_average": _round(f_token_average),
             "f_token_max": _round(f_token_max),
@@ -128,17 +123,14 @@ def compute_dynamic_context_budget(signals, ranges=None):
             "wm": wm_budget,
         },
         "failure": {
-            "context_build_failure": 1.0 if signals.get("context_build_failure") else 0.0,
-            "target": failure_target,
-            "required_tokens": int(signals.get("failure_required_tokens") or 0),
-            "failed_budget": int(signals.get("failure_failed_budget") or 0),
-            "budget_action": failure_budget_action,
+            "continuous_session_context_budget_failure_count": int(signals.get("continuous_session_context_budget_failure_count") or 0),
+            "f_failure": _round(f_failure),
         },
     }
 
 
 
-def compute_and_store_dynamic_context_budget(messages, runtime_state=None, emit_observer=True, stabilize=False):
+def compute_and_store_dynamic_context_budget(messages, runtime_state=None, emit_observer=True, stabilize=False, apply_stabilizer=True):
     signals = collect_context_pressure_signals(messages, runtime_state)
     try:
         from .context_budget_override import annotate_budget_override, effective_budget_ranges
@@ -166,12 +158,13 @@ def compute_and_store_dynamic_context_budget(messages, runtime_state=None, emit_
             status = annotate_budget_override(status, create=bool(stabilize))
     except Exception:
         pass
-    try:
-        from .budget_stabilizer import apply_budget_stabilizer
+    if apply_stabilizer:
+        try:
+            from .budget_stabilizer import apply_budget_stabilizer
 
-        status = apply_budget_stabilizer(status, persist=bool(stabilize))
-    except Exception:
-        pass
+            status = apply_budget_stabilizer(status, persist=bool(stabilize))
+        except Exception:
+            pass
     if runtime_state is not None:
         runtime_state["context_pressure"] = status
         if emit_observer:
@@ -192,6 +185,8 @@ def format_context_pressure_status(status):
     budgets = status.get("budgets") or {}
     scores = status.get("scores") or {}
     signals = status.get("signals") or {}
+    failure = status.get("failure") or {}
+    capacity = status.get("capacity") or {}
     lines = [
         "Context Pressure status:",
         f"budget_source: {status.get('budget_source') or '(none)'}",
@@ -208,7 +203,10 @@ def format_context_pressure_status(status):
         f"S: {scores.get('S', 0)}",
         f"L: {scores.get('L', 0)}",
         f"P_context: {scores.get('P_context', 0)}",
-        f"failure_budget_action: {(status.get('failure') or {}).get('budget_action', 'none')}",
+        f"failure_count: {failure.get('continuous_session_context_budget_failure_count', 0)}",
+        f"f_failure: {failure.get('f_failure', (status.get('features') or {}).get('f_failure', 0))}",
+        f"capacity_plan: {capacity.get('capacity_plan', 'not_planned')}",
+        f"capacity_recovery_action: {capacity.get('capacity_recovery_action', 'none')}",
         f"context_build_seq: {(status.get('stabilizer') or {}).get('context_build_seq', 0)}",
         f"stm_hold_until_seq: {(status.get('stabilizer') or {}).get('stm_hold_until_seq', 0)}",
         f"wm_hold_until_seq: {(status.get('stabilizer') or {}).get('wm_hold_until_seq', 0)}",

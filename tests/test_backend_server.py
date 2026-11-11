@@ -97,6 +97,30 @@ def test_backend_broadcasts_one_event_to_all_clients():
     assert first.messages[0]["params"]["turn_id"] == "turn-1"
 
 
+def test_backend_broadcast_event_accepts_and_preserves_wake_correlation_ids():
+    server = BackendServer(input_stream=io.StringIO(), output_stream=io.StringIO())
+    client = FakeClient()
+    server.clients.add(client)
+
+    server.send_event(
+        "wake_delivered",
+        {"wake_id": "wake-1", "source": "maintainer", "kind": "maintenance_task_resumed"},
+        turn_id="turn-1",
+        request_id="request-1",
+        parent_id="turn-parent-1",
+    )
+
+    assert client.messages[0]["params"] == {
+        "event_id": client.messages[0]["params"]["event_id"],
+        "turn_id": "turn-1",
+        "request_id": "request-1",
+        "parent_id": "turn-parent-1",
+        "type": "wake_delivered",
+        "sequence": 1,
+        "payload": {"wake_id": "wake-1", "source": "maintainer", "kind": "maintenance_task_resumed"},
+    }
+
+
 def test_backend_preserves_json_rpc_error_codes():
     class BusyBackend(BackendServer):
         def dispatch(self, method, params):

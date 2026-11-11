@@ -847,9 +847,9 @@ def _stage_wm_ingress(messages, runtime_state, commit=False):
     return {
         "staged_watermark": staged,
         "commit_result": commit_result,
-        "selected_blocks": [_block_metadata(block) for block in projection.get("selected_blocks") or []],
-        "omitted_blocks": [_block_metadata(block) for block in projection.get("omitted_blocks") or []],
-        "watermark_locked_omitted_block_count": projection.get("watermark_locked_omitted_block_count", 0),
+        "selected_units": [_block_metadata(unit) for unit in projection.get("selected_units") or []],
+        "omitted_units": [_block_metadata(unit) for unit in projection.get("omitted_units") or []],
+        "watermark_locked_omitted_unit_count": projection.get("watermark_locked_omitted_unit_count", 0),
     }
 
 

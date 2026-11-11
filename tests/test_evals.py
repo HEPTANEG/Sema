@@ -102,7 +102,7 @@ def test_grader_supports_memory_engine_snapshot_assertions(tmp_path):
                     {"path": "storage.slot_count", "gte": 5},
                     {"path": "context_preview.context_order", "contains_all": ["system", "short_term_memory"]},
                     {
-                        "path": "context_preview.short_term_memory.omitted_blocks",
+                        "path": "context_preview.short_term_memory.omitted_units",
                         "contains_object": {"start_index": 1, "end_index": 2},
                     },
                 ]
@@ -119,7 +119,7 @@ def test_grader_supports_memory_engine_snapshot_assertions(tmp_path):
                 "storage": {"slot_count": 5},
                 "context_preview": {
                     "context_order": ["system", "working_memory", "long_term_memory", "short_term_memory"],
-                    "short_term_memory": {"omitted_blocks": [{"start_index": 1, "end_index": 2}]},
+                    "short_term_memory": {"omitted_units": [{"start_index": 1, "end_index": 2}]},
                 },
             }
         },

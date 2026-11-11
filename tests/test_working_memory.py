@@ -17,12 +17,18 @@ def _omitted_first_block(_messages, **_kwargs):
     return {
         "budget": 10000,
         "selected_tokens": 10,
-        "selected_block_count": 1,
-        "omitted_block_count": 1,
-        "latest_block_tokens": 10,
-        "total_block_count": 2,
-        "selected_blocks": [{"kind": "interaction", "start_index": 3, "end_index": 4, "message_count": 2, "token_count": 10}],
-        "omitted_blocks": [{"kind": "interaction", "start_index": 1, "end_index": 2, "message_count": 2, "token_count": 1000}],
+        "selected_unit_count": 2,
+        "omitted_unit_count": 2,
+        "latest_unit_tokens": 5,
+        "total_unit_count": 4,
+        "selected_units": [
+            {"kind": "user", "start_index": 3, "end_index": 3, "message_count": 1, "token_count": 5},
+            {"kind": "assistant", "start_index": 4, "end_index": 4, "message_count": 1, "token_count": 5},
+        ],
+        "omitted_units": [
+            {"kind": "user", "start_index": 1, "end_index": 1, "message_count": 1, "token_count": 20},
+            {"kind": "assistant", "start_index": 2, "end_index": 2, "message_count": 1, "token_count": 1000},
+        ],
     }
 
 
@@ -30,14 +36,19 @@ def _omitted_two_blocks(_messages, **_kwargs):
     return {
         "budget": 10000,
         "selected_tokens": 10,
-        "selected_block_count": 1,
-        "omitted_block_count": 2,
-        "latest_block_tokens": 10,
-        "total_block_count": 3,
-        "selected_blocks": [{"kind": "interaction", "start_index": 5, "end_index": 6, "message_count": 2, "token_count": 10}],
-        "omitted_blocks": [
-            {"kind": "interaction", "start_index": 1, "end_index": 2, "message_count": 2, "token_count": 1000},
-            {"kind": "interaction", "start_index": 3, "end_index": 4, "message_count": 2, "token_count": 1000},
+        "selected_unit_count": 2,
+        "omitted_unit_count": 4,
+        "latest_unit_tokens": 5,
+        "total_unit_count": 6,
+        "selected_units": [
+            {"kind": "user", "start_index": 5, "end_index": 5, "message_count": 1, "token_count": 5},
+            {"kind": "assistant", "start_index": 6, "end_index": 6, "message_count": 1, "token_count": 5},
+        ],
+        "omitted_units": [
+            {"kind": "user", "start_index": 1, "end_index": 1, "message_count": 1, "token_count": 20},
+            {"kind": "assistant", "start_index": 2, "end_index": 2, "message_count": 1, "token_count": 1000},
+            {"kind": "user", "start_index": 3, "end_index": 3, "message_count": 1, "token_count": 20},
+            {"kind": "assistant", "start_index": 4, "end_index": 4, "message_count": 1, "token_count": 1000},
         ],
     }
 
@@ -219,7 +230,7 @@ def test_working_memory_projection_uses_current_dynamic_stm_budget(isolated_work
     def fake_status(_messages, budget=10000, wm_ingress_watermark=-1):
         captured["budget"] = budget
         captured["watermark"] = wm_ingress_watermark
-        return {"omitted_blocks": [], "omitted_block_count": 0}
+        return {"omitted_units": [], "omitted_unit_count": 0}
 
     monkeypatch.setattr(working_memory.wm_ingress, "current_stm_budget", lambda _messages, _state: 4321)
     monkeypatch.setattr(working_memory.wm_ingress, "effective_wm_ingress_watermark", lambda _state: 17)
@@ -227,7 +238,7 @@ def test_working_memory_projection_uses_current_dynamic_stm_budget(isolated_work
 
     status, slots = working_memory._omitted_slot_sequences([_message("user", "test")], {"turn": 1})
 
-    assert status["omitted_block_count"] == 0
+    assert status["omitted_unit_count"] == 0
     assert slots == set()
     assert captured == {"budget": 4321, "watermark": 17}
 
@@ -258,7 +269,7 @@ def test_working_memory_status_uses_effective_stm_boundary_without_creating_stat
     rendered = json.dumps(status, ensure_ascii=False)
 
     assert status["stm"]["wm_ingress_watermark"] == 2
-    assert status["stm"]["watermark_locked_omitted_block_count"] == 1
+    assert status["stm"]["watermark_locked_omitted_unit_count"] == 2
     assert status["candidate_count"] == 1
     assert [candidate["slot_seq"] for candidate in status["current_candidates"]] == [2]
     assert "locked user" not in rendered
@@ -310,10 +321,6 @@ def test_working_memory_status_explains_candidates_and_recent_processed(isolated
 
     assert "current_candidates:" in rendered
     assert "recent_processed:" in rendered
-    assert "last_candidate_policy:" in rendered
-    assert "last_preflight_target:" in rendered
-    assert "last_reprocessed_slot_seqs:" in rendered
-    assert "last_fallback_candidate_count:" in rendered
     assert "summarized_count" in rendered
     assert "compression_ratio=" in rendered
     assert "compress old detail" in rendered
@@ -453,118 +460,6 @@ def test_working_memory_need_context_is_recorded_as_keep_raw(isolated_workspace,
     assert event_stream.load_active_projection() == messages
 
 
-def test_preflight_working_memory_recovery_summarizes_latest_oversized_block(isolated_workspace, monkeypatch):
-    import memory_engine.event_stream as event_stream
-    from persistence import session
-    import memory_engine.wm.working_memory as working_memory
-
-    messages = [
-        _message("system", "system"),
-        _message("user", "previous short request"),
-        _message("assistant", "previous short answer"),
-        _message("user", _long_text()),
-        _message("assistant", "short tail stays raw"),
-    ]
-    session.ensure_project()
-    session.save_last_session(messages)
-    monkeypatch.setattr(
-        working_memory,
-        "_call_model_json",
-        lambda _prompt: json.dumps({"action": "summarize", "summary": "Preflight summary.", "reason": "oversized latest block"}),
-    )
-
-    result = working_memory.run_preflight_working_memory_recovery(
-        messages,
-        RuntimeError("STM latest interaction block exceeds budget: latest_block_tokens=12000, budget=10000."),
-    )
-
-    assert result["triggered"] is True
-    assert result["preflight"] is True
-    assert result["candidate_count"] == 1
-    assert result["summarized_count"] == 1
-    assert result["processed_slot_seqs"] == [3]
-    active = event_stream.load_active_projection()
-    assert active[3]["summary"] == "Preflight summary."
-    assert active[4] == messages[4]
-
-
-def test_preflight_working_memory_recovery_runs_once_and_can_keep_raw(isolated_workspace, monkeypatch):
-    import memory_engine.event_stream as event_stream
-    from persistence import session
-    import memory_engine.wm.working_memory as working_memory
-
-    messages = [
-        _message("system", "system"),
-        _message("user", _long_text()),
-    ]
-    session.ensure_project()
-    session.save_last_session(messages)
-    monkeypatch.setattr(
-        working_memory,
-        "_call_model_json",
-        lambda _prompt: json.dumps({"action": "need_context", "summary": "", "reason": "needs context"}),
-    )
-
-    result = working_memory.run_preflight_working_memory_recovery(
-        messages,
-        RuntimeError("STM latest interaction block exceeds budget: latest_block_tokens=12000, budget=10000."),
-    )
-
-    assert result["triggered"] is True
-    assert result["processed_count"] == 1
-    assert result["kept_raw_count"] == 1
-    assert result["updated"] is False
-    assert event_stream.load_active_projection() == messages
-
-
-def test_preflight_recovery_can_reprocess_prior_kept_raw_slot(isolated_workspace, monkeypatch):
-    import memory_engine.event_stream as event_stream
-    from persistence import session
-    import memory_engine.wm.working_memory as working_memory
-
-    messages = [
-        _message("system", "system"),
-        _message("user", _long_text()),
-    ]
-    session.ensure_project()
-    session.save_last_session(messages)
-    original_slot = event_stream.load_slot(1)
-    monkeypatch.setattr(
-        working_memory,
-        "_call_model_json",
-        lambda _prompt: json.dumps({"action": "need_context", "summary": "", "reason": "first pass keeps raw"}),
-    )
-    first = working_memory.run_preflight_working_memory_recovery(
-        messages,
-        RuntimeError("STM latest interaction block exceeds budget: latest_block_tokens=12000, budget=10000."),
-    )
-    assert first["kept_raw_count"] == 1
-    assert event_stream.load_active_projection() == messages
-
-    monkeypatch.setattr(
-        working_memory,
-        "_call_model_json",
-        lambda _prompt: json.dumps({"action": "summarize", "summary": "Recovered summary.", "reason": "preflight retry"}),
-    )
-
-    second = working_memory.run_preflight_working_memory_recovery(
-        messages,
-        RuntimeError("STM latest interaction block exceeds budget: latest_block_tokens=12000, budget=10000."),
-    )
-
-    slot = event_stream.load_slot(1)
-    active_event = event_stream.load_event(slot["active_event_id"])
-    assert second["updated"] is True
-    assert second["candidate_policy"] == "preflight_threshold_or_kept_raw"
-    assert second["preflight_target"] == "stm_latest_block"
-    assert second["reprocessed_slot_seqs"] == [1]
-    assert slot["original_event_id"] == original_slot["original_event_id"]
-    assert slot["active_event_id"] != slot["original_event_id"]
-    assert active_event["kind"] == "sum"
-    assert event_stream.load_active_projection()[1]["summary"] == "Recovered summary."
-    assert event_stream.load_messages() == messages
-
-
 def test_working_memory_maintenance_still_skips_prior_kept_raw_slot(isolated_workspace, monkeypatch):
     from persistence import session
     import memory_engine.wm.working_memory as working_memory
@@ -595,58 +490,7 @@ def test_working_memory_maintenance_still_skips_prior_kept_raw_slot(isolated_wor
     assert calls == []
 
 
-def test_preflight_latest_block_fallback_selects_top_three_largest_subthreshold_slots(isolated_workspace, monkeypatch):
-    import memory_engine.event_stream as event_stream
-    from persistence import session
-    import memory_engine.wm.working_memory as working_memory
-
-    messages = [
-        _message("system", "system"),
-        _message("user", _medium_text("one")),
-        _message("assistant", _medium_text("two") * 2),
-        _message("tool", _medium_text("three") * 3),
-        _message("assistant", _medium_text("four") * 4),
-        _message("assistant", _medium_text("five") * 5),
-    ]
-    session.ensure_project()
-    session.save_last_session(messages)
-    records = event_stream.load_active_trunk_records()
-    for slot_seq in range(1, 6):
-        assert records[slot_seq]["active_token_count"] <= working_memory.SUM_TRIGGER_TOKENS
-    calls = []
-
-    def fake_decision(prompt):
-        payload = json.loads(prompt[1]["content"])
-        calls.append(payload["candidate"]["slot_seq"])
-        return json.dumps(
-            {
-                "action": "summarize",
-                "summary": f"Fallback summary {payload['candidate']['slot_seq']}.",
-                "reason": "fallback",
-            }
-        )
-
-    monkeypatch.setattr(working_memory, "_call_model_json", fake_decision)
-
-    result = working_memory.run_preflight_working_memory_recovery(
-        messages,
-        RuntimeError("STM latest interaction block exceeds budget: latest_block_tokens=12000, budget=10000."),
-    )
-
-    active = event_stream.load_active_projection()
-    assert result["candidate_policy"] == "preflight_top_n_largest"
-    assert result["fallback_candidate_count"] == 3
-    assert result["processed_slot_seqs"] == [3, 4, 5]
-    assert calls == [3, 4, 5]
-    assert active[1] == messages[1]
-    assert active[2] == messages[2]
-    assert active[3]["summary"] == "Fallback summary 3."
-    assert active[4]["summary"] == "Fallback summary 4."
-    assert active[5]["summary"] == "Fallback summary 5."
-    assert event_stream.event_stream_status()["sum_event_count"] == 3
-
-
-def test_preflight_wm_slot_retries_exact_prior_kept_raw_slot(isolated_workspace, monkeypatch):
+def test_compact_exact_slot_summarizes_only_requested_slot(isolated_workspace, monkeypatch):
     import memory_engine.event_stream as event_stream
     from persistence import session
     import memory_engine.wm.working_memory as working_memory
@@ -659,37 +503,46 @@ def test_preflight_wm_slot_retries_exact_prior_kept_raw_slot(isolated_workspace,
     ]
     session.ensure_project()
     session.save_last_session(messages)
-    monkeypatch.setattr(working_memory, "stm_projection_status", _omitted_first_block)
-    monkeypatch.setattr(
-        working_memory,
-        "_call_model_json",
-        lambda _prompt: json.dumps({"action": "keep_raw", "summary": "", "reason": "ordinary keep raw"}),
-    )
-    working_memory.run_working_memory_maintenance(messages, force=True)
     original_slot = event_stream.load_slot(2)
     calls = []
 
     def fake_decision(prompt):
         payload = json.loads(prompt[1]["content"])
         calls.append(payload["candidate"]["slot_seq"])
-        return json.dumps({"action": "summarize", "summary": "Exact slot summary.", "reason": "preflight exact retry"})
+        return json.dumps({"action": "summarize", "summary": "Exact slot summary.", "reason": "capacity recovery"})
 
     monkeypatch.setattr(working_memory, "_call_model_json", fake_decision)
 
-    result = working_memory.run_preflight_working_memory_recovery(
-        messages,
-        RuntimeError("Context Builder WM slot exceeds budget: slot_seq=2, tokens=7000, budget=6000."),
-    )
+    result = working_memory.compact_exact_slot(2)
 
     slot = event_stream.load_slot(2)
-    assert result["candidate_policy"] == "preflight_exact_slot"
-    assert result["preflight_target"] == "wm_slot"
-    assert result["reprocessed_slot_seqs"] == [2]
-    assert result["processed_slot_seqs"] == [2]
+    assert result["action"] == "summarized"
     assert calls == [2]
     assert slot["original_event_id"] == original_slot["original_event_id"]
     assert event_stream.load_event(slot["active_event_id"])["kind"] == "sum"
     assert event_stream.load_active_projection()[2]["summary"] == "Exact slot summary."
+
+
+def test_compact_exact_slot_uses_bounded_ref_when_summary_is_unavailable(isolated_workspace, monkeypatch):
+    import memory_engine.event_stream as event_stream
+    from persistence import session
+    import memory_engine.wm.working_memory as working_memory
+
+    messages = [_message("system", "system"), _message("user", _long_text())]
+    session.ensure_project()
+    session.save_last_session(messages)
+    original_slot = event_stream.load_slot(1)
+    monkeypatch.setattr(working_memory, "_call_model_json", lambda _prompt: (_ for _ in ()).throw(RuntimeError("offline")))
+
+    result = working_memory.compact_exact_slot(1)
+
+    slot = event_stream.load_slot(1)
+    active = event_stream.load_event(slot["active_event_id"])
+    assert result["action"] == "bounded_ref"
+    assert slot["original_event_id"] == original_slot["original_event_id"]
+    assert active["kind"] == "ref"
+    assert active["content"]["truncated"] is True
+    assert _long_text() not in str(active["content"])
 
 
 def test_messages_for_model_uses_context_builder_after_working_memory(isolated_workspace, monkeypatch):

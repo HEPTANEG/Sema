@@ -36,7 +36,7 @@ def _patch_wm_preview(monkeypatch, selected_slots, wm_slots=None):
         lambda *_args, **_kwargs: {
             "ok": True,
             "working_memory": {"selected_slot_seqs": list(selected_slots)},
-            "short_term_memory": {"omitted_blocks": omitted},
+            "short_term_memory": {"omitted_units": omitted},
         },
     )
 

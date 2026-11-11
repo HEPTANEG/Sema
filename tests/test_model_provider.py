@@ -82,6 +82,27 @@ class _PoolResponse:
         self.closed = True
 
 
+def test_pooled_response_enforces_total_timeout():
+    class Lease:
+        def release(self, _reusable):
+            pass
+
+    class SlowResponse:
+        will_close = False
+
+        def read(self, _amount=-1):
+            time.sleep(0.03)
+            return b"x"
+
+        def close(self):
+            pass
+
+    response = model_provider._PooledResponse(Lease(), SlowResponse(), timeout=0.05)
+    with pytest.raises(TimeoutError, match="total timeout"):
+        response.read()
+    response.close()
+
+
 class _PoolConnection:
     instances = []
 
@@ -214,6 +235,26 @@ def test_custom_model_config_uses_explicit_protocol_without_profile(monkeypatch,
     assert config["provider"] == "custom-news"
     assert config["protocol"] == "openai_compatible"
     assert config["model"] == "news-model"
+
+
+def test_saved_model_takes_precedence_over_environment_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("SEMA_HOME", str(tmp_path))
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-chat")
+    monkeypatch.setenv("SEMA_MODEL", "environment-model")
+    model_provider.save_global_model_config({"provider": "deepseek", "model": "saved-model"})
+
+    config = model_provider.load_model_config()
+
+    assert config["model"] == "saved-model"
+
+
+def test_environment_model_is_used_when_no_model_is_saved(monkeypatch, tmp_path):
+    monkeypatch.setenv("SEMA_HOME", str(tmp_path))
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+    config = model_provider.load_model_config()
+
+    assert config["model"] == "deepseek-chat"
 
 
 def test_save_global_model_config_sets_kimi_profile(monkeypatch, tmp_path):

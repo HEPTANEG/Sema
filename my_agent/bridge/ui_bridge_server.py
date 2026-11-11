@@ -43,6 +43,7 @@ from runtime import maintenance_gate
 from runtime.agent_phase import get_agent_phase
 from memory_engine.ltm.maintenance_runner import run_ltm_maintenance
 from runtime.wake import WakeQueue, WakeScheduler, wake_event
+from runtime.maintenance_sleep import MaintenanceControlRequested
 
 
 JSONRPC_VERSION = "2.0"
@@ -86,6 +87,7 @@ class BridgeServer:
         self._pending_message_responses = 0
         self._auto_ltm_maintenance_running = False
         self._auto_ltm_maintenance_error = ""
+        self.runtime_state["maintenance_continuation"] = None
         self._auto_ltm_condition = threading.Condition(self.state_lock)
         self._eval_queue = queue.Queue()
         self._eval_requests = {}
@@ -94,8 +96,9 @@ class BridgeServer:
         self._turn_request_ids = {}
         self._turn_parent_ids = {}
         self.wake_queue = WakeQueue()
-        self.wake_scheduler = WakeScheduler(self.wake_queue, self._deliver_wake)
+        self.wake_scheduler = WakeScheduler(self.wake_queue, self._deliver_wake, on_retry=self._wake_retry_diagnostic)
         self.runtime_state["wake_callback"] = self.enqueue_wake
+        self.runtime_state["wake_enqueue_status_callback"] = self.enqueue_wake_status
         self.runtime_state["wake_discard_session"] = self.wake_queue.discard_session
 
     def run(self):
@@ -310,6 +313,7 @@ class BridgeServer:
         turn_id = uuid.uuid4().hex
         phase = None
         main_phase_held = False
+        turn_result = None
         try:
             if request_id and receipts is not None:
                 receipts.begin(request_id, turn_id)
@@ -318,35 +322,15 @@ class BridgeServer:
             phase = get_agent_phase(get_project_info().get("root"))
             if phase.snapshot()["maintainer_active"]:
                 raise JsonRpcError(-32011, "LTM Maintainer is running. User messages are disabled until it finishes.")
-            gate = maintenance_gate.user_turn_gate_status()
-            pressure = gate["pressure"]
-            if gate["blocked"]:
-                if source != "tui":
-                    raise JsonRpcError(
-                        -32020,
-                        maintenance_pressure.maintenance_pressure_gate_message(pressure),
-                        {"code": "ltm_maintenance_pressure_gate", **pressure},
-                    )
-                if self._start_auto_ltm_maintenance():
-                    return {
-                        "accepted": True,
-                        "maintenance_started": True,
-                        "pending_prompt": prompt,
-                        "pressure": pressure,
-                    }
-                return {
-                    "accepted": True,
-                    "maintenance_started": True,
-                    "maintenance_already_running": True,
-                    "pending_prompt": prompt,
-                    "pressure": pressure,
-                }
+            continuation = self.runtime_state.get("maintenance_continuation")
+            if isinstance(continuation, dict) and continuation.get("status") in {"sleep_requested", "running", "resuming"}:
+                raise JsonRpcError(-32011, "The Main-Agent task is paused for LTM maintenance or its resume Wake. Wait for the Runtime to resume it.")
             if not phase.acquire_main():
                 raise JsonRpcError(-32011, "LTM Maintainer is running. User messages are disabled until it finishes.")
             main_phase_held = True
             self._start_turn(turn_id, source)
             self.send_event("user_message", {"content": prompt}, turn_id=turn_id)
-            return self._run_message_turn(prompt, turn_id)
+            turn_result = self._run_message_turn(prompt, turn_id)
         except Exception as error:
             if request_id and receipts is not None:
                 receipts.fail(request_id, error)
@@ -354,13 +338,17 @@ class BridgeServer:
         finally:
             if request_id and receipts is not None:
                 receipt = receipts.get(request_id)
-                if receipt and receipt.get("status") == "running":
+                if receipt and receipt.get("status") == "running" and not self.runtime_state.get("_maintenance_control_result"):
                     receipts.interrupt(request_id)
                 self.remote_request_ids.pop(turn_id, None)
             self._finish_turn(turn_id)
             if phase is not None and main_phase_held:
                 phase.release_main()
             self.turn_lock.release()
+        control = self.runtime_state.pop("_maintenance_control_result", None)
+        if control:
+            self._dispatch_maintenance_control(control, turn_id, request_id)
+        return turn_result or {"ok": True, "last_run": list(self.runtime_state.get("last_run", []))}
 
     def _enqueue_eval_message(self, params, prompt, request_id):
         request_id = request_id or "eval_" + uuid.uuid4().hex
@@ -582,6 +570,7 @@ class BridgeServer:
             self._auto_ltm_maintenance_error = ""
 
         def run():
+            continuation = self.runtime_state.get("maintenance_continuation") or {}
             try:
                 run_ltm_maintenance(runtime_state=self.runtime_state, force=True)
             except Exception as error:
@@ -601,8 +590,11 @@ class BridgeServer:
 
     def enqueue_wake(self, source, kind, payload, processing_class="user_like", wake_id=None):
         """Queue a background-agent result for a future Main Agent turn."""
+        return self.enqueue_wake_status(source, kind, payload, processing_class, wake_id) == "queued"
+
+    def enqueue_wake_status(self, source, kind, payload, processing_class="user_like", wake_id=None):
         session_key = (payload or {}).get("continuation_id") if source == "retriever" else None
-        return self.wake_queue.put(
+        return self.wake_queue.put_status(
             wake_event(
                 source,
                 kind,
@@ -615,67 +607,144 @@ class BridgeServer:
             )
         )
 
+    def _wake_retry_diagnostic(self, event, status, reason):
+        reason = reason or "delivery not accepted"
+        report_attempt = event.delivery_attempts & (event.delivery_attempts - 1) == 0
+        should_report = (
+            event.last_diagnostic_status != status
+            or event.last_diagnostic_reason != reason
+            or report_attempt
+        )
+        if not should_report:
+            return
+        event.last_diagnostic_status = status
+        event.last_diagnostic_reason = reason
+        event.last_diagnostic_attempt = event.delivery_attempts
+        event_type = "wake_deferred" if status == "deferred" else "wake_failed"
+        payload = {
+            "wake_id": event.wake_id,
+            "attempt": event.delivery_attempts,
+            "reason": reason,
+        }
+        if event_type == "wake_failed":
+            payload["error"] = payload["reason"]
+        self.send_event(event_type, payload)
+
     def _deliver_wake(self, event):
+
+        if event.main_agent_started:
+            return True
+
+        def defer(reason):
+            event.last_delivery_status = "deferred"
+            event.last_delivery_reason = reason
+            return False
 
         with self.state_lock:
             arrival_counter = self._user_arrival_counter
             if self._pending_message_responses:
-                return False
+                return defer("pending message response")
+            if event.source == "maintainer" and event.kind in {"maintenance_task_resumed", "maintenance_sleep_failed"} and self._auto_ltm_maintenance_running:
+                return defer("Maintainer has not released its running state")
             if self._eval_queue.qsize() > 0:
-                return False
+                return defer("evaluation request is pending")
         time.sleep(0.01)
         with self.state_lock:
             if self._user_arrival_counter != arrival_counter:
-                return False
+                return defer("a user message arrived before wake delivery")
         if event.source == "retriever":
             continuation_id = (event.payload or {}).get("continuation_id") if isinstance(event.payload, dict) else None
             session = self.runtime_state.get("memory_retrieval_session")
             if continuation_id and (not isinstance(session, dict) or session.get("continuation_id") != continuation_id):
                 return True
         if not self.turn_lock.acquire(blocking=False):
-            return False
+            return defer("Main Agent turn lock is occupied")
         turn_id = uuid.uuid4().hex
         phase = None
         main_phase_held = False
+        wake_request_id = event.parent_request_id
         try:
             self._ensure_initialized()
             phase = get_agent_phase(get_project_info().get("root"))
             if not phase.acquire_main():
-                return False
+                return defer("Main Agent phase is unavailable")
             main_phase_held = True
             self._start_turn(
                 turn_id,
                 "wake",
-                request_id=event.parent_request_id,
+                request_id=wake_request_id,
                 parent_id=event.parent_turn_id,
             )
+            if wake_request_id and hasattr(self, "remote_request_ids"):
+                self.remote_request_ids[turn_id] = wake_request_id
             payload = event.payload if isinstance(event.payload, dict) else {"value": event.payload}
             content = json.dumps({"source": event.source, "kind": event.kind, "payload": payload}, ensure_ascii=False)
             message = {"role": "user", "source": event.source, "content": f"<runtime-wake source=\"{event.source}\">{content}</runtime-wake>"}
-            self.send_event(
-                "wake_delivered",
-                {
-                    "wake_id": event.wake_id,
-                    "source": event.source,
-                    "kind": event.kind,
-                    "processing_class": event.processing_class,
-                },
-                turn_id=turn_id,
-                request_id=event.parent_request_id,
-                parent_id=event.parent_turn_id,
-            )
+
+            def mark_wake_started():
+                event.message_persisted = True
+                if event.source == "maintainer" and event.kind == "maintenance_sleep_failed":
+                    continuation = self.runtime_state.get("maintenance_continuation") or {}
+                    continuation.update({
+                        "status": "failed",
+                        "failure_count": int(payload.get("failure_count") or continuation.get("failure_count") or 1),
+                        "failure_reason": payload.get("failure_reason") or "Maintenance failed.",
+                        "run_id": payload.get("maintenance_run_id") or continuation.get("run_id"),
+                    })
+                    self.runtime_state["maintenance_continuation"] = continuation
+                elif event.source == "maintainer" and event.kind == "maintenance_task_resumed":
+                    continuation = self.runtime_state.get("maintenance_continuation") or {}
+                    continuation["status"] = "resuming"
+                    continuation["run_id"] = payload.get("maintenance_run_id") or continuation.get("run_id")
+                    self.runtime_state["maintenance_continuation"] = continuation
+                    self.runtime_state["maintenance_resume_wake"] = True
+                if not event.wake_announced:
+                    self.send_event(
+                        "wake_delivered",
+                        {
+                            "wake_id": event.wake_id,
+                            "source": event.source,
+                            "kind": event.kind,
+                            "processing_class": event.processing_class,
+                        },
+                        turn_id=turn_id,
+                        request_id=event.parent_request_id,
+                        parent_id=event.parent_turn_id,
+                    )
+                    event.wake_announced = True
+
+            def mark_main_agent_started():
+                event.main_agent_started = True
+
+            if event.message_persisted:
+                mark_wake_started()
+
             self._run_message_turn(
                 message["content"],
                 turn_id,
                 message_record=message,
                 processing_class=event.processing_class,
+                message_already_persisted=event.message_persisted,
+                on_message_persisted=mark_wake_started,
+                on_agent_loop_started=mark_main_agent_started,
             )
+            control = self.runtime_state.pop("_maintenance_control_result", None)
+            if control:
+                self._dispatch_maintenance_control(control, turn_id, wake_request_id)
+            if event.source == "maintainer" and event.kind == "maintenance_task_resumed" and not event.main_agent_started:
+                self.runtime_state["maintenance_continuation"] = None
+                self.runtime_state.pop("maintenance_resume_wake", None)
             return True
         except Exception as error:
-            self.send_event("wake_failed", {"wake_id": event.wake_id, "error": str(error)}, turn_id=turn_id)
+            if event.main_agent_started:
+                return True
+            event.last_delivery_status = "failed"
+            event.last_delivery_reason = str(error)
             return False
         finally:
             self._finish_turn(turn_id)
+            if hasattr(self, "remote_request_ids"):
+                self.remote_request_ids.pop(turn_id, None)
             if phase is not None and main_phase_held:
                 phase.release_main()
             self.turn_lock.release()
@@ -726,6 +795,9 @@ class BridgeServer:
         created_at=None,
         request_id=None,
         parent_id=None,
+        on_message_persisted=None,
+        message_already_persisted=False,
+        on_agent_loop_started=None,
     ):
         with patch_agent_for_headless(
             self.confirmations,
@@ -734,18 +806,21 @@ class BridgeServer:
         ):
             try:
                 self.runtime_state["turn_processing_class"] = processing_class or "user_like"
-                self.runtime_state["turn_start_index"] = len(self.messages)
+                self.runtime_state["turn_start_index"] = max(0, len(self.messages) - 1) if message_already_persisted else len(self.messages)
                 turn_start_index = self.runtime_state["turn_start_index"]
                 self.runtime_state.pop("trajectory_context", None)
                 self.runtime_state.pop("trace_id", None)
                 mark_turn_started(self.runtime_state)
                 self.runtime_state["streaming_enabled"] = bool(load_model_config().get("supports_streaming"))
                 self.runtime_state["assistant_message_id"] = f"assistant-{uuid.uuid4().hex}"
-                append_message_and_persist(
-                    self.messages,
-                    message_record or {"role": "user", "content": prompt},
-                    created_at=created_at,
-                )
+                if not message_already_persisted:
+                    append_message_and_persist(
+                        self.messages,
+                        message_record or {"role": "user", "content": prompt},
+                        created_at=created_at,
+                    )
+                    if callable(on_message_persisted):
+                        on_message_persisted()
                 self.send_event(
                     "assistant_stage",
                     {
@@ -774,6 +849,8 @@ class BridgeServer:
                     return {"ok": True, "last_run": list(self.runtime_state.get("last_run", []))}
                 self.runtime_state["trajectory_context"] = start_trajectory("main_agent")
                 self.runtime_state["trace_id"] = self.runtime_state["trajectory_context"].get("trajectory_id")
+                if callable(on_agent_loop_started):
+                    on_agent_loop_started()
                 agent.answer_with_tools(self.messages, self.permissions, self.runtime_state)
                 self._send_final_answer_fallback(turn_id, turn_start_index)
             except agent.ToolRunStopped as error:
@@ -782,6 +859,28 @@ class BridgeServer:
                 mark_assistant_turn_finished(self.runtime_state)
                 event_type = "turn_cancelled" if self.runtime_state.get("cancel_requested") else "agent_stopped"
                 self.send_event(event_type, {"message": str(error)}, turn_id=turn_id)
+            except MaintenanceControlRequested as error:
+                action = error.action
+                self.runtime_state["_maintenance_control_result"] = action
+                mark_assistant_turn_finished(self.runtime_state)
+                if action.get("action") == "handoff":
+                    message = str(action.get("message") or "Maintenance failed; the task remains paused.")
+                    append_message_and_persist(self.messages, {"role": "assistant", "content": message})
+                    continuation = self.runtime_state.get("maintenance_continuation") or {}
+                    continuation["status"] = "handed_off"
+                    self.runtime_state["maintenance_continuation"] = continuation
+                    self.send_event("final_answer", {
+                        "path": "maintenance_handoff",
+                        "message_id": self.runtime_state.get("assistant_message_id"),
+                        "content": message,
+                        "content_chars": len(message),
+                    }, turn_id=turn_id)
+                    save_last_session(self.messages)
+                else:
+                    self.send_event("assistant_stage", {
+                        "label": "Pausing for LTM maintenance...",
+                        "message_id": self.runtime_state.get("assistant_message_id"),
+                    }, turn_id=turn_id)
             except KeyboardInterrupt:
                 append_message_and_persist(
                     self.messages,
@@ -810,7 +909,106 @@ class BridgeServer:
                 self.runtime_state.pop("streaming_enabled", None)
                 self.runtime_state.pop("assistant_message_id", None)
                 self.runtime_state.pop("turn_processing_class", None)
-        return {"ok": True, "last_run": list(self.runtime_state.get("last_run", []))}
+        result = {"ok": True, "last_run": list(self.runtime_state.get("last_run", []))}
+        control = self.runtime_state.get("_maintenance_control_result")
+        if control:
+            result.update({"suspended": True, "maintenance_action": control.get("action")})
+        return result
+
+    def _dispatch_maintenance_control(self, action, parent_turn_id=None, parent_request_id=None):
+        """Start maintenance only after the Main-Agent turn lock has been released."""
+        if action.get("action") == "handoff":
+            self.runtime_state.pop("maintenance_resume_wake", None)
+            return
+        continuation = self.runtime_state.get("maintenance_continuation")
+        if action.get("action") == "sleep":
+            previous = continuation if isinstance(continuation, dict) and continuation.get("status") == "resuming" else {}
+            continuation = {
+                "status": "running",
+                "continuation_id": previous.get("continuation_id") or uuid.uuid4().hex,
+                "wake_prompt": action.get("wake_prompt", ""),
+                "failure_count": int(previous.get("failure_count") or 0),
+                "run_id": None,
+                "parent_turn_id": parent_turn_id or "",
+                "parent_request_id": parent_request_id or "",
+            }
+            self.runtime_state["maintenance_continuation"] = continuation
+            from runtime.maintenance_sleep import (
+                clear_request_decision,
+                pressure_trace_fields,
+                release_mandatory_latch,
+            )
+            released_latch = release_mandatory_latch(self.runtime_state)
+            clear_request_decision(self.runtime_state)
+            if released_latch:
+                agent.trace_event(
+                    self.runtime_state,
+                    "maintenance.gate_released",
+                    status="ok",
+                    reason="continuation_running",
+                    request_index=released_latch.get("request_index") or 0,
+                    **pressure_trace_fields(released_latch.get("snapshot")),
+                )
+        elif action.get("action") == "retry":
+            if not isinstance(continuation, dict):
+                return
+            continuation["status"] = "running"
+        else:
+            return
+        if not self._start_maintenance_continuation():
+            self._maintenance_continuation_failed("Runtime could not start the LTM Maintainer.", continuation.get("run_id"))
+
+    def _start_maintenance_continuation(self):
+        from runtime.setup_capabilities import ltm_enabled
+        if not ltm_enabled():
+            return False
+        with self.state_lock:
+            if self._auto_ltm_maintenance_running:
+                return False
+            self._auto_ltm_maintenance_running = True
+            self._auto_ltm_maintenance_error = ""
+
+        def run():
+            continuation = self.runtime_state.get("maintenance_continuation") or {}
+            try:
+                # A Wake can request another sleep while its delivery still owns the turn lock.
+                self.turn_lock.acquire()
+                self.turn_lock.release()
+                continuation = self.runtime_state.get("maintenance_continuation") or {}
+                result = run_ltm_maintenance(runtime_state=self.runtime_state, force=True)
+                if result.get("status") != "completed":
+                    self._maintenance_continuation_failed(result.get("failure_reason") or result.get("status") or "Maintenance failed.", result.get("run_id"))
+            except Exception as error:
+                self._maintenance_continuation_failed(str(error), continuation.get("run_id"))
+            finally:
+                with self._auto_ltm_condition:
+                    self._auto_ltm_maintenance_running = False
+                    self._auto_ltm_condition.notify_all()
+
+        threading.Thread(target=run, name="ltm-maintenance-continuation", daemon=True).start()
+        return True
+
+    def _maintenance_continuation_failed(self, reason, run_id=None):
+        continuation = self.runtime_state.get("maintenance_continuation") or {}
+        continuation["status"] = "failed"
+        continuation["failure_count"] = int(continuation.get("failure_count") or 0) + 1
+        continuation["failure_reason"] = str(reason)
+        continuation["run_id"] = run_id or continuation.get("run_id")
+        self.runtime_state["maintenance_continuation"] = continuation
+        payload = {
+            "maintenance_run_id": continuation.get("run_id"),
+            "continuation_id": continuation.get("continuation_id"),
+            "wake_prompt": continuation.get("wake_prompt"),
+            "parent_turn_id": continuation.get("parent_turn_id"),
+            "parent_request_id": continuation.get("parent_request_id"),
+            "failure_count": continuation["failure_count"],
+            "failure_reason": continuation["failure_reason"],
+        }
+        self.enqueue_wake(
+            "maintainer", "maintenance_sleep_failed", payload,
+            processing_class="tool_result_like",
+            wake_id=f"wake_maintenance_failed_{continuation.get('run_id')}_{continuation['failure_count']}",
+        )
 
     def _send_final_answer_fallback(self, turn_id, start_index=0):
         if self.runtime_state.get("ui_final_answer_sent"):

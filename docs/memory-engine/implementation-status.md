@@ -23,17 +23,37 @@
 - During an online LTM Push, the existing `assistant_stage` status surface reports `Generating memory retrieval queries`, `Searching long-term memory`, `Rank 2: Ranking long-term memory`, and `Rank 3: Selecting long-term memory`. These are observability-only stages and do not add transcript messages or alter the LTM Push pipeline.
 - Online STM/WM/Focus maintenance runs after final answers and does not block
   response generation. LTM Maintenance uses a separate offline mode started
-  explicitly or by the full maintenance-pressure gate.
+  explicitly or through the Main Agent's pressure-aware `sleep_for_maintenance`
+  tool; successful Main-Agent-initiated runs resume their process-local task by
+  Wake, while failed runs return retry or handoff controls.
 - `read_file` is STM-safe for large file ingress. It supports line ranges, character ranges, returned character caps, explicit full-read requests for warning-sized files, observable `ok | warn_large | too_large` statuses, bounded first-100-line previews for large files, and `get_overview` for navigation and triage before exact raw range reads.
+- STM projects a continuous newest suffix of ordinary message slots and atomic
+  assistant-tool-result bundles. Interaction blocks remain available for
+  Focus and Evidence semantics but no longer determine STM capacity.
+- Capacity Planner combines Dynamic Context Budget with structural STM and WM
+  requirements. It persists one shared continuous-session budget-failure
+  update and both 80/10 Stabilizer results per real provider Context Build.
+  Read-only surfaces preview the same plan without advancing state.
+- Current-turn WM pins preserve an external user instruction from its
+  immutable original event after it leaves STM, share the WM budget, and clear
+  on the next external user message. Runtime-originated user-role messages do
+  not affect the pin.
+- Every Main Agent tool result passes a common pre-append ingress guard. An
+  oversized atomic bundle stores the complete result as an Event Stream
+  artifact and appends only a bounded `too_large` envelope. Oversized WM RAW or
+  REF records receive one exact-slot compaction attempt followed by a bounded
+  active REF when necessary.
+- Exception-driven context retry, transient `context_build_failure` state, and
+  interaction-block/top-three Preflight WM Recovery are removed.
 - Online Formation processes the current Formation Buffer only. Formation Backfill runs one background batch at a time for older Event Stream ranges outside that buffer and resumes from persisted Formation state.
 - Focus-aware WM Projection separates prompt injection from logical residency. Active segments contribute detailed records, inactive segments contribute titles and summaries, and resolved segments contribute titles only; the dynamic WM budget limits the final rendered text. Online and Formation Backfill keep using the raw WM suffix selector. The background sequence is Online Formation, Formation Backfill, one-time Residency V2 Reconciliation, read-only pre-audit, resolved-only Focus Range Retirement, and persisted final audit. Reconciliation restores valid retired active/inactive assignments and retired unassigned units created under the prior semantics. Retirement affects only complete resolved units that have left STM and are fully captured by Formation WorkItems. Segment metadata, assignment audit rows, Event Stream records, and Formation references remain intact. Status surfaces report injected and resident metrics separately. Repairable consistency findings can schedule the existing Focus Maintainer on a later background cycle with fingerprint cooldown; residency and retirement findings do not invoke model repair.
-- LTM Push is part of the foreground provider-context build and fails open: a failed push leaves a metadata-only failure state and a placeholder, while the Main Agent continues with the remaining context.
+- LTM Push is part of the foreground provider-context build and has a 60-second end-to-end deadline, including cold starts of its local services. It fails open when the deadline expires: metadata-only diagnostics remain available, while the Main Agent continues with STM and Working Memory without a Memory Push placeholder.
 - The Provider uses a process-local Keep-Alive pool. Metadata-only latency
   diagnostics remain available for measuring foreground context construction,
   Query Compiler, and Rank 3 behavior without recording message bodies.
 - LTM Store no longer stores MemoryObject lifecycle `status`. Numeric Store-owned derived strength controls retrieval eligibility and maintenance priority, while MemoryLink lifecycle is represented by `link_state = active | inactive`.
 - Manual LTM Maintenance is available through `/memory ltm maintain`. It runs an isolated five-stage Maintainer ReAct loop, exposes only Maintainer observation/write tools, writes through the Store's intent compiler and atomic commit path, displays realtime progress and the active stage in a dedicated TUI view, composes completed-run `maintenance_summary` sections for future Maintainer orientation, and emits a completion Wake without writing internal maintenance messages to Event Stream.
-- Maintenance pressure is computed from the unmaintained portion of the dynamic Formation Buffer frontier with a 100-slot threshold; STM and newer WM slots do not increase the backlog. Maintainer fixes its frontier and coverage target at invocation start, may inspect newer projections as reference, but cannot create `sourced_from` provenance or advance coverage beyond that frontier. Soft pressure notices are injected into Main Agent provider context at 0.5, 0.75, and 0.9. At pressure 1.0, the existing automatic Maintenance path starts for TUI input while the pending user message is retained; slash/status/debug commands remain allowed.
+- Maintenance pressure is computed from the unmaintained portion of the dynamic Formation Buffer frontier with a 200-slot threshold; STM and newer WM slots do not increase the backlog. Maintainer fixes its frontier and coverage target at invocation start, may inspect newer projections as reference, but cannot create `sourced_from` provenance or advance coverage beyond that frontier. One request-scoped decision controls the Main Agent notice, offered tools, boundary checks, and sleep authorization. Soft pressure notices are injected at 0.5, 0.75, and 0.9, corresponding to 100, 150, and 180 unmaintained Slots. At pressure 1.0, the user message enters context and Runtime latches the mandatory sleep boundary until Bridge establishes a maintenance continuation; the existing Wake mechanism resumes the suspended task after maintenance.
 
 ## Persistence
 
@@ -41,4 +61,4 @@ Event Stream data is project-scoped under `.sema/memory/event_stream/`. LTM stor
 
 ## Verification
 
-The Python suite covers Event Stream persistence, context construction, WM, Focus Segments, observer isolation, LTM storage/retrieval/formation, embedding service protocol tests, LTM Push Candidate Pool and Rank 1/2/3 behavior, and model tool calling. TUI tests cover bridge protocol, rendering behavior, and foreground status updates. A separate opt-in embedding smoke test loads the locally installed BGE-M3 model. There is no fixed end-to-end LTM Push latency target yet; current performance is measured from real usage and optimized incrementally.
+The Python suite covers Event Stream persistence, context construction, WM, Focus Segments, observer isolation, LTM storage/retrieval/formation, embedding service protocol tests, LTM Push Candidate Pool and Rank 1/2/3 behavior, foreground deadline fail-open behavior, and model tool calling. TUI tests cover bridge protocol, rendering behavior, and foreground status updates. A separate opt-in embedding smoke test loads the locally installed BGE-M3 model. Foreground LTM Push has a fixed 60-second end-to-end deadline; performance is measured from real usage and optimized incrementally.

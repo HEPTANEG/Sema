@@ -200,7 +200,7 @@ def test_context_builder_uses_legacy_projection_without_focus_state(isolated_wor
     session.save_last_session([_message("system", "system"), _message("user", "legacy detail")])
     projection = context_builder._build_working_memory_projection(
         {
-            "selected_blocks": [],
+            "selected_units": [],
             "wm_ingress_watermark": 1,
         },
         budget=500,
@@ -278,17 +278,18 @@ def test_context_builder_and_observer_share_focus_projection(isolated_workspace,
     pressure = {
         "budget_source": "dynamic",
         "scores": {},
-        "budgets": {"stm": 100, "wm": 1000},
+        "budgets": {"stm_min": 1000, "stm_max": 50000, "stm": 1000, "wm_min": 1000, "wm_max": 50000, "wm": 1000},
         "signals": {},
     }
     stm = {
         "messages": [messages[0]],
-        "budget": 100,
+        "budget": 1000,
         "selected_tokens": 1,
-        "selected_blocks": [],
-        "omitted_blocks": [{"start_index": 1, "end_index": 6}],
-        "latest_block_tokens": 0,
-        "total_blocks": 1,
+        "selected_units": [],
+        "omitted_units": [{"start_index": 1, "end_index": 6}],
+        "latest_unit_tokens": 0,
+        "total_units": 1,
+        "wm_ingress_watermark": -1,
     }
     monkeypatch.setattr(context_builder, "compute_and_store_dynamic_context_budget", lambda *_args, **_kwargs: pressure)
     monkeypatch.setattr(observer, "_observer_pressure", lambda *_args, **_kwargs: pressure)
@@ -322,7 +323,7 @@ def test_formation_buffer_keeps_using_raw_wm_window(isolated_workspace, monkeypa
     monkeypatch.setattr(
         formation,
         "build_stm_projection",
-        lambda *_args, **_kwargs: {"selected_blocks": [], "omitted_blocks": []},
+        lambda *_args, **_kwargs: {"selected_units": [], "omitted_units": []},
     )
     monkeypatch.setattr(
         context_builder,

@@ -1,151 +1,124 @@
 # Short-Term Memory (STM)
 
-STM is Sema's recent, high-fidelity Event Stream workspace. It preserves the
-latest interaction context for provider calls without summarizing, truncating,
-or reordering its selected content.
+STM is Sema's recent, high-fidelity Event Stream projection. It supplies a
+chronological suffix of provider-valid messages without summarizing,
+truncating, or reordering selected content.
 
 ## Responsibilities And Boundaries
 
-STM is an Event Stream projection, not a separate source of truth. It:
+STM is not a separate store. It reads immutable Event Stream messages and:
 
-- keeps recent trunk RAW events directly injectable;
-- may retain tool output and intermediate execution details while work is
-  unfolding;
-- uses the effective Dynamic Context Budget rather than a fixed time window;
-- does not summarize content, create Focus Segments, or perform retrieval; and
-- never truncates an individual message or interaction block.
+- preserves leading system messages outside the STM token budget;
+- selects recent eligible projection units under the effective STM budget;
+- exposes metadata-only selected and omitted ranges;
+- hands older ranges to WM through a monotonic ingress watermark; and
+- never summarizes or semantically retrieves content.
 
-Working Memory owns compression of material that has left STM. Focus Segments
-exist only in WM. The Event Stream remains the factual source for all layers.
-See [Working Memory](wm.md) for RAW/ref to SUM maintenance and preflight
-recovery.
+Working Memory owns compression after content leaves STM. Focus, LTM, and
+historical Evidence remain separate consumers of the Event Stream.
 
-## Projection Contract
+## Projection Units
 
-STM Projection V1 is:
+STM budget selection uses these units:
 
-```text
-STM = latest complete eligible interaction blocks that fit in the current budget
-```
+- an ordinary user message is one unit;
+- an ordinary assistant message is one unit;
+- an assistant message containing tool calls plus all immediately following
+  matching tool results is one atomic `tool_bundle`; and
+- unmatched legacy messages remain independent orphan units so projection
+  never silently drops them.
 
-An interaction block contains:
+Tool bundles enter and leave STM together. This preserves the provider
+protocol requirement that an assistant tool call and its results remain
+adjacent and complete.
 
-```text
-one user message
-+ following Sema/tool/file/system messages
-+ stops before the next user message
-```
+`build_interaction_blocks()` remains available for Focus ingest, historical
+Evidence, and user-turn range semantics. Interaction blocks are not STM budget
+selection units.
 
-Leading system messages are preserved separately and do not count toward a
-normal interaction block. Selection walks backward from the newest eligible
-complete block, stops before a block that would exceed the budget, then restores
-the selected blocks to their original order.
+## Selection Contract
 
-If the latest eligible complete interaction block alone exceeds the STM budget,
-context construction fails with a clear user-visible error. STM does not split
-or silently truncate that block.
+STM selects one continuous newest suffix of eligible units:
 
-## STM-Safe File Read Ingress
+1. Exclude every unit that starts at or before the effective WM ingress
+   watermark. This also locks a bundle that intersects the watermark.
+2. Walk backward from the newest eligible unit.
+3. Add complete units while they fit.
+4. Stop at the first unit that does not fit. Do not skip it to select older,
+   smaller units.
+5. Restore selected units to chronological order.
 
-Large file reads are guarded before they enter the newest STM interaction
-block. The `read_file` tool is no longer an all-or-nothing raw file ingestion
-path: it supports bounded line ranges, bounded character ranges, returned
-character caps, and explicit full-read requests.
+The newest unit's rendered token count is `STM_required`. When it exceeds the
+formula budget but remains within the configured STM maximum, Capacity Planner
+raises the current candidate budget enough to fit it. If it exceeds the
+maximum, Sema returns a typed capacity error and does not call the Main Agent
+provider.
 
-`read_file` accepts:
+## Tool Ingress Guard
 
-- `path`
-- `start_line`
-- `line_count`
-- `start_char`
-- `char_count`
-- `max_chars`
-- `full_read`
+Every Main Agent tool result is checked after execution and before Event Stream
+append. The guard measures the whole current tool bundle against the effective
+STM maximum.
 
-Line ranges and character ranges are mutually exclusive. Line ranges are
-navigation controls for normal text and source files; they are not a safety
-guarantee, because one line may contain many thousands of tokens. Character
-ranges are available for minified JSON, long TXT records, generated payloads,
-and other files that do not have useful line breaks. All returned bodies remain
-bounded by `max_chars` or the default safe cap.
+When a result would make the bundle exceed that maximum:
 
-File reads report one of three statuses:
+- the full result is stored as an independent durable Event Stream artifact;
+- active history receives a bounded `too_large` envelope;
+- the envelope includes a preview, character and token counts, the artifact
+  ID, and applicable next actions; and
+- an artifact-write failure produces a small technical-error envelope and
+  never falls back to appending the oversized body.
 
-- `ok`: the requested content was returned within the active limits.
-- `warn_large`: the file or requested range is large, so the default response
-  returns metadata plus a bounded first-100-line preview and recommends a
-  range read or `get_overview`.
-- `too_large`: the file is beyond the hard full-read limit, so full raw reading
-  is refused and only metadata plus a bounded first-100-line preview is
-  returned.
+File results recommend ranged `read_file` or `get_overview`. Other tools
+recommend narrower arguments. `get_overview` is navigation output and does not
+replace reading relevant source ranges.
 
-For `warn_large`, the Main Agent may explicitly request `full_read=true`, but
-the result is still subject to the absolute safe cap. `too_large` files must be
-inspected through line ranges, character ranges, or `get_overview`.
-
-`get_overview` is a general navigation and triage tool for text files. It
-accepts `path`, a task-specific `instruction`, and an optional `max_chars`.
-Overview output is not source text and must not replace reading the relevant
-raw ranges with `read_file`.
-
-## Dynamic Budget
-
-STM capacity comes from the effective STM budget produced by Dynamic Context
-Budget and Budget Stabilizer. The pressure model, manual maximum overrides,
-failure saturation, and stabilizer rules are defined in
-[Context Builder and Context Budget](stm-wm-context.md#dynamic-context-budget).
-
-The same effective budget must be used by Context Builder and Working Memory
-candidate selection so they agree on which blocks are outside STM.
+Model-generated oversized assistant text and oversized tool-call arguments are
+not rewritten by this guard.
 
 ## WM Ingress Watermark
 
-STM uses a one-way WM ingress watermark:
+The effective ingress watermark is the maximum of persisted, runtime, and
+staged values. Omitted units may stage their highest end slot. After a
+successful answer, Runtime projects the complete post-answer history and
+commits the staged watermark before WM and Focus maintenance.
 
-- Once a complete interaction block is omitted from STM, its end slot can be
-  staged as the WM ingress watermark for the active turn.
-- A final assistant message can itself push an older block outside STM. After
-  the final answer succeeds, Runtime stages the complete post-answer history
-  with the same effective STM budget, then persists the watermark before
-  Working Memory and Segment Ingest maintenance run.
-- Blocks whose `end_index <= wm_ingress_watermark_slot_seq` are locked out of
-  future STM projections, even if later STM budgets grow.
-- Budget growth therefore applies only to future blocks after the watermark.
+The watermark only moves forward. Once a unit intersects or precedes it, that
+unit cannot re-enter STM after later budget growth.
 
-Every STM consumer honors the effective watermark. This includes Context
-Builder, WM candidate selection, status and observer projections, and the
-read-only `get_stm_evidence()` API. Historical raw inspection remains available
-through the separate Event Stream evidence APIs; it is not STM evidence.
+Every STM consumer uses the same effective watermark, including Context
+Builder, WM candidate selection, Observer, status commands, eval metadata, and
+`get_stm_evidence()`. Historical slot, range, interaction-block, and artifact
+Evidence APIs remain available independently of STM selection.
 
-## Context And Interfaces
+## Current-Turn User Handoff
 
-Context Builder assembles provider context in this order:
+When the latest external user message leaves the current STM projection, WM
+derives a current-turn pin from that same projection. The provider context
+contains exactly one representation: the original user slot in STM or its WM
+pin. The next external user message clears the old pin. Runtime-originated
+messages using the provider `user` role do not participate.
 
-```text
-system prompt
-LTM  automatic LTM Push projection when available
-WM   active trunk timeline reminder
-STM  latest complete raw interaction blocks
-```
+## Observability
 
-STM Projection provides the selected and omitted interaction-block metadata to
-Context Builder. Omitted blocks may advance WM ingress; later WM maintenance
-can summarize eligible older slots. STM itself does not invoke WM maintenance.
+STM metadata uses unit terminology:
 
-`/memory stm status` and Observer context previews are metadata-only. They
-report budget, watermark, token counts, block counts, and selected or omitted
-ranges without exposing message bodies.
+- `selected_units` and `omitted_units`;
+- `selected_unit_count` and `omitted_unit_count`;
+- `latest_unit_tokens` and `largest_unit_tokens`; and
+- watermark and token totals.
+
+Omitted metadata contains only kind, range, message count, and token count. It
+does not contain message bodies.
 
 ## Implementation Map
 
-- `memory_engine.stm_projection` defines interaction-block construction and
-  projection selection.
-- `memory_engine.wm.ingress` computes, stages, and persists the monotonic
-  ingress watermark. The formal package API is exposed through
-  `memory_engine.wm`.
-- `memory_engine.context_builder` consumes STM Projection for provider context.
-- `memory_engine.evidence.get_stm_evidence` exposes a bounded, read-only STM
-  evidence preview using the same effective watermark.
-- `tools.read_file_for_context` and `tools.get_file_overview_for_context`
-  provide bounded file ingress before large raw file payloads can inflate the
-  newest STM interaction block.
+- `memory_engine.stm_projection`: interaction blocks, projection units, and
+  continuous-suffix selection.
+- `memory_engine.capacity_planner`: structural STM requirement and effective
+  budget planning.
+- `memory_engine.tool_ingress`: provider-visible tool-result guard.
+- `memory_engine.wm.ingress`: monotonic STM-to-WM watermark.
+- `memory_engine.wm.pins`: current-turn external-user handoff.
+- `memory_engine.context_builder`: provider projection assembly.
+- `memory_engine.evidence`: bounded read-only STM and historical Evidence.

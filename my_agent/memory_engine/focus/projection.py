@@ -158,14 +158,22 @@ def build_working_memory_projection(records, render_record, budget):
         render_record,
     )
     metadata_tokens = count_tokens(metadata_content)
-    if active_candidates:
-        newest = active_candidates[0]
+    required_content = metadata_content
+    required_candidates = sorted(
+        [*active_candidates, *unowned_candidates],
+        key=lambda item: int(item["slot_seq"]),
+        reverse=True,
+    )
+    if required_candidates:
+        newest = required_candidates[0]
+        newest_slot = int(newest["slot_seq"])
+        newest_segment = active_by_slot.get(newest_slot)
         required_content = _render_focus_projection(
             selected_resolved,
             selected_inactive,
             selected_active,
-            [],
-            {active_by_slot[int(newest["slot_seq"])]: [newest]},
+            [] if newest_segment else [newest],
+            {newest_segment: [newest]} if newest_segment else {},
             render_record,
         )
         required_tokens = count_tokens(required_content)
@@ -274,6 +282,8 @@ def build_working_memory_projection(records, render_record, budget):
         "resolved_title_count": len(selected_resolved),
         "resident_slot_count": len(resident_slot_seqs),
         "resident_raw_token_count": resident_raw_tokens,
+        "required_tokens": count_tokens(required_content),
+        "_required_content": required_content,
     }
 
 

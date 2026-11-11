@@ -196,6 +196,19 @@ def load_artifact(artifact_id, root=None):
         return result
 
 
+def store_artifact(content, artifact_type="tool_output", root=None):
+    content_json = json.dumps(content, ensure_ascii=False, sort_keys=True)
+    with ensure_event_stream(root) as connection:
+        artifact_id, token_count = _store_artifact_json(connection, content_json, artifact_type, root)
+        connection.commit()
+    return {
+        "artifact_id": artifact_id,
+        "artifact_type": str(artifact_type or "text"),
+        "size_bytes": len(content_json.encode("utf-8")),
+        "token_count": token_count,
+    }
+
+
 
 def check_integrity(root=None):
     errors = []
@@ -540,6 +553,14 @@ def load_message(message_index, root=None):
 
 
 def create_sum_event(slot_seq, metadata, root=None):
+    return _create_active_event(slot_seq, "sum", metadata, root=root)
+
+
+def create_ref_event(slot_seq, metadata, root=None):
+    return _create_active_event(slot_seq, "ref", metadata, root=root)
+
+
+def _create_active_event(slot_seq, kind, metadata, root=None):
     slot_seq = int(slot_seq)
     content = dict(metadata or {})
     with ensure_event_stream(root) as connection:
@@ -560,7 +581,7 @@ def create_sum_event(slot_seq, metadata, root=None):
             INSERT INTO events (event_id, slot_id, kind, content_ref, inline_content, token_count, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (event_id, slot["slot_id"], "sum", content_ref, inline_content, token_count, created_at),
+            (event_id, slot["slot_id"], str(kind), content_ref, inline_content, token_count, created_at),
         )
         connection.execute(
             "UPDATE slots SET active_event_id = ? WHERE slot_seq = ?",
@@ -671,12 +692,18 @@ def _store_content(connection, content_json, source, root):
     if len(content_json) <= INLINE_CONTENT_MAX_CHARS:
         return "inline", content_json, token_count
 
+    artifact_type = "tool_output" if source == "tool" else "text"
+    artifact_id, token_count = _store_artifact_json(connection, content_json, artifact_type, root)
+    return artifact_id, None, token_count
+
+
+def _store_artifact_json(connection, content_json, artifact_type, root):
     artifact_id = f"art_{uuid4().hex}"
+    token_count = count_text_tokens(content_json)
     content_bytes = content_json.encode("utf-8")
     digest = hashlib.sha256(content_bytes).hexdigest()
     path = artifacts_dir(root) / f"{artifact_id}.json"
     path.write_bytes(content_bytes)
-    artifact_type = "tool_output" if source == "tool" else "text"
     connection.execute(
         """
         INSERT INTO artifacts (artifact_id, artifact_type, storage_path, size_bytes, token_count, content_hash, created_at)
@@ -684,7 +711,7 @@ def _store_content(connection, content_json, source, root):
         """,
         (artifact_id, artifact_type, str(path), len(content_bytes), token_count, digest, _now()),
     )
-    return artifact_id, None, token_count
+    return artifact_id, token_count
 
 
 def _load_messages(connection, root, event_id_column):

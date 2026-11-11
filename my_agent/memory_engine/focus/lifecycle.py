@@ -105,7 +105,7 @@ def _focus_lifecycle_projection(messages=None, runtime_state=None):
         for slot in ((preview.get("working_memory") or {}).get("selected_slot_seqs") or [])
     }
     wm_slots = set()
-    for block in ((preview.get("short_term_memory") or {}).get("omitted_blocks") or []):
+    for block in ((preview.get("short_term_memory") or {}).get("omitted_units") or []):
         try:
             start = int(block.get("start_index"))
             end = int(block.get("end_index"))

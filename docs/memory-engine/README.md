@@ -10,8 +10,8 @@ design history.
 1. [Implementation Status](implementation-status.md) - what exists now, boundaries, and migration notes.
 2. [Design Principles](design-principles.md) - global constraints, performance model, and high-level design rules.
 3. [Event Stream](event-stream.md) - factual source, storage model, slots/events/artifacts, and projections.
-4. [Short-Term Memory](stm.md) - STM Projection, interaction blocks, one-way WM ingress, evidence, and observability.
-5. [Working Memory](wm.md) - `memory_engine.wm` package API, RAW/ref to SUM maintenance, candidate selection, evidence retry, preflight recovery, and downstream handoffs.
+4. [Short-Term Memory](stm.md) - slot and atomic-tool-bundle projection, one-way WM ingress, tool ingress guard, evidence, and observability.
+5. [Working Memory](wm.md) - `memory_engine.wm` package API, RAW/ref to SUM maintenance, current-turn pins, exact-slot recovery, and downstream handoffs.
 6. [Context Builder and Context Budget](stm-wm-context.md) - provider-context assembly, Dynamic Context Budget, Budget Stabilizer, and design validation.
 7. [Focus Segment](focus.md) - WM attention scheduling, Detector, Segment Ingest, and Full Maintainer concepts.
 8. [Runtime Wake](runtime-wake.md) - process-local background-to-Main-Agent wake delivery, scheduling, provenance, and provider projection.

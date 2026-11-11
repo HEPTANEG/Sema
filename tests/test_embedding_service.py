@@ -185,6 +185,23 @@ def test_adapter_retries_failed_cold_start_once(monkeypatch, tmp_path):
     assert adapter._base_url == "http://127.0.0.1:1234"
 
 
+def test_adapter_closes_service_after_request_timeout(monkeypatch):
+    from memory_engine.ltm import embedding_adapter
+
+    adapter = embedding_adapter.EmbeddingAdapter.__new__(embedding_adapter.EmbeddingAdapter)
+    adapter._base_url = "http://local"
+    adapter._process = object()
+    adapter._lock = threading.RLock()
+    closed = []
+    monkeypatch.setattr(adapter, "close", lambda: closed.append(True))
+    monkeypatch.setattr(embedding_adapter, "urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("slow")))
+
+    with pytest.raises(embedding_adapter.EmbeddingServiceTimeout):
+        adapter._request_json("GET", "/health", timeout_seconds=0.01)
+
+    assert closed == [True]
+
+
 def test_embedding_service_reserves_stdout_for_readiness(monkeypatch, capsys):
     from memory_engine.ltm import embedding_service
 

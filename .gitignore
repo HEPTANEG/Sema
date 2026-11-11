@@ -60,9 +60,11 @@ my_agent/.sema/
 sema_eval/runs/
 sema_eval/results/
 docs/.obsidian/
+docs/for-human-only/
 tui/node_modules/
 tui/packages/**/node_modules/
 tui/dist/
+tui/packages/hermes-ink/dist/
 .venv-reranker/
 .vite/
 build/

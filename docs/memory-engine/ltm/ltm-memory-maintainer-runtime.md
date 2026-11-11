@@ -47,6 +47,34 @@ frontier and the existing maintenance cursor. An empty Buffer leaves the
 cursor unchanged while all semantic stages still run. Manual resume computes
 the boundary again.
 
+## Plan Commit Diagnostics and Recovery
+
+`submit_maintenance_plan` remains a single atomic Store operation, but Runtime
+records its internal progress in trajectory so a stalled submission can be
+located without asking the model to emit diagnostic calls. The phases are
+`compile`, `close_retriever`, `ensure_ltm_store`, `stage_vector_embedding`,
+`install_vector_index`, and `sqlite_commit`, when applicable. These events are
+Runtime-only; they are not injected into the Maintainer prompt and do not add
+new model-visible tools.
+
+`embedding_request` and `vector_index_staging` separately identify the two
+parts of vector preparation. Native staged index mutations run in a bounded
+worker process; an abnormal worker exit or timeout is a technical vector sync
+failure and does not commit the Plan. A backend connection loss during an
+active maintenance view is displayed as an interruption by the TUI.
+
+Vector embedding and staging use a bounded technical timeout. A timeout returns
+`vector_sync_timeout` before canonical rows are committed, and the local
+Embedding Service is closed so a stalled subprocess is not retained. The
+Maintainer reports the technical failure and does not treat it as a plan
+rejection that the model can repair.
+
+The durable maintenance state records the owning process ID and heartbeat. If
+a new process finds a `running` run whose owner process no longer exists, it
+marks the old Maintainer trajectory as interrupted and starts a new run while
+preserving the coverage cursor and committed-plan checkpoint. A live owner is
+not replaced; a normal failed-run retry continues to use its existing run ID.
+
 ## Maintenance Pressure
 
 Current maintenance pressure uses the same maintainable Formation Buffer
@@ -55,16 +83,56 @@ frontier as the Maintainer:
 ```text
 unmaintained_maintainable_slots =
   max(0, maintainable_frontier - maintenance_coverage_cursor)
-pressure = min(1.0, unmaintained_maintainable_slots / 100)
+pressure = min(1.0, unmaintained_maintainable_slots / 200)
 ```
 
 The latest Event Stream slot, STM, and newer WM do not increase this backlog.
-At `0.5`, `0.75`, and `0.9`, Runtime injects progressively stronger internal
-sleep signals into Main-Agent context. At `1.0`, an ordinary TUI message
-automatically starts Maintenance and remains pending rather than entering a
-Main-Agent turn; manual `/memory ltm maintain` remains available. The existing
-Main-Agent projection is otherwise unchanged by these notices, and pressure
-does not interrupt a turn that has already started.
+Runtime computes one pressure decision when building each Main-Agent request.
+The notice, tool schema, response boundary, and sleep-tool authorization all
+use that request-scoped decision; the executor does not independently revoke a
+tool that was offered to the model. The dynamic notice is replaced with the
+latest snapshot rather than accumulated in conversation history. At `0.5`,
+`0.75`, and `0.9` (100, 150, and 180 unmaintained Slots with the current
+200-slot denominator), the notice becomes progressively stronger, and the
+`sleep_for_maintenance` tool becomes available. Below `0.5`, that tool is not
+offered for a new request.
+
+At `1.0`, maintenance is mandatory at the next model decision boundary. An
+in-flight model response and its complete returned tool-call batch are allowed
+to finish; subsequent ordinary tool calls and final answers are rejected.
+Runtime then exposes only `sleep_for_maintenance` until the Main Agent submits
+a valid request. Crossing `1.0` creates a process-local mandatory latch. A
+later retreat of the dynamic Formation Buffer frontier may lower the live
+pressure, but cannot restore ordinary tools or final answers. The latch is
+released only after Bridge establishes the running maintenance continuation;
+that continuation then owns the paused-task lifecycle. After a successful
+maintenance Wake, the continuation enters `resuming` while the Main Agent
+continues the paused task. If pressure reaches a sleep threshold again during
+that resumed task, `sleep_for_maintenance` is accepted in `resuming`, reuses
+the same continuation ID, updates the wake prompt, and starts a new maintenance
+run. A continuation in `running` or `sleep_requested` remains non-reentrant.
+The user message that reaches the threshold is first added to the Main-Agent
+context. The sleep tool
+must be the only tool call in its response and must provide a `wake_prompt`
+describing the task, exact progress, and next step. Runtime suspends the task
+in process memory, runs Maintainer, and uses the existing Wake path to resume
+the Main Agent with that prompt and the maintenance summary. STM and WM are not
+cleared, but the prompt is the explicit continuation pointer. No latch or
+continuation is restored after a process restart. Manual `/memory ltm maintain`
+keeps its existing completion narration Wake.
+
+Trajectory records the request snapshot that authorized sleep, the latch
+transition, accepted sleep requests, and any difference between the decision
+snapshot and the live diagnostic snapshot at execution. The live snapshot is
+diagnostic only and cannot invalidate the request-scoped authorization.
+
+If maintenance fails, Runtime wakes Main Agent with the failure reason,
+failure-attempt count, original `wake_prompt`, and `maintenance_run_id`. Only
+`retry_ltm_maintenance` and `return_maintenance_failure` are available. Retry
+uses the same run ID and continuation prompt. Returning the failure gives the
+user a normal chat explanation while retaining the paused continuation in
+process memory; ordinary task work remains unavailable. Runtime does not set
+a retry-count ceiling.
 
 A separate proposal to degrade the Main-Agent projection at `0.7`, `0.8`, and
 `0.9` is intentionally deferred. If later implemented, it must affect only
@@ -114,14 +182,13 @@ submitted text before accepting the stage report. Runtime does not truncate the
 first over-limit submission automatically, because the model should have an
 opportunity to preserve the important semantic material.
 
-For a summary from 500 through 1,000 tokens, Runtime returns a strong rewrite
-notice and allows two rewrites. For a summary above 1,000 tokens, Runtime
-returns a stronger notice repeated three times and allows four rewrites. The
-notice includes the measured token count, the hard limit, and asks the model to
-rewrite from scratch without calling observation tools again. If the applicable
+Runtime accepts summaries up to 1,000 tokens. Above 1,000 through 2,000 tokens it
+allows two rewrites; above 2,000 it allows four and repeats the notice three
+times. Each model-facing notice requests a rewrite below 500 tokens without
+revealing the runtime tolerance. If the applicable
 rewrite allowance is exhausted, Runtime applies tokenizer-aware truncation and
 accepts the stage if its stage, status, ordering, and evidence are otherwise
-valid. The accepted summary remains within 500 tokens; the complete original
+valid. The accepted summary remains within 1,000 tokens; the complete original
 model response remains available in trajectory diagnostics. Overflow recovery
 does not count as an ordinary stage-protocol violation and does not fail an
 otherwise valid maintenance run.

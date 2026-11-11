@@ -12,17 +12,18 @@ def _projection():
         "messages": [_message("system", "system"), _message("user", "latest")],
         "budget": 10000,
         "selected_tokens": 2,
-        "selected_blocks": [
-            {"kind": "interaction", "messages": [_message("user", "latest")], "start_index": 1, "end_index": 1}
+        "selected_units": [
+            {"kind": "user", "messages": [_message("user", "latest")], "start_index": 1, "end_index": 1}
         ],
-        "omitted_blocks": [],
+        "omitted_units": [],
         "wm_ingress_watermark": -1,
+        "latest_unit_tokens": 2,
     }
 
 
 def _pressure():
     return {
-        "budgets": {"stm": 10000, "wm": 10000},
+        "budgets": {"stm_min": 1000, "stm_max": 50000, "stm": 10000, "wm_min": 1000, "wm_max": 50000, "wm": 10000},
         "scores": {},
         "signals": {},
     }

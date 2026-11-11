@@ -221,6 +221,8 @@ def append_message_and_persist(messages, message, created_at=None):
             raise
         event_stream.save_messages([*messages, safe_message], created_at_by_index={len(messages): created_at})
     messages.append(safe_message)
+    from memory_engine.wm import on_message_persisted
+    on_message_persisted(safe_message)
     project["active_conversation_id"] = EVENT_STREAM_CONVERSATION_ID
     project["conversations"] = []
     _save_project_file(project)

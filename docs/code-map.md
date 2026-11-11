@@ -6,6 +6,8 @@ Sema is a local coding agent with a TypeScript/React/Ink TUI and a Python backen
 
 - `my_agent/memory_engine/ltm/ltm_store.py`: formula v2, migration anchors,
   live graph views and run-idempotent logical deletion.
+- `my_agent/memory_engine/ltm/vector_stage_worker.py`: isolated native vector
+  staging worker, called by the vector index adapter.
 - `my_agent/memory_engine/ltm/storage_gate.py`: activity/write exclusion,
   including process-scoped locks released on exit.
 - `my_agent/memory_engine/ltm/storage_management.py`: per-library capacity
@@ -31,6 +33,10 @@ Sema is a local coding agent with a TypeScript/React/Ink TUI and a Python backen
 - `my_agent/runtime/agent.py`: main model/tool loop integration, prompt construction, recovery, and background scheduling.
 - `my_agent/runtime/model_runtime.py`: provider payload construction, streaming, retry, and model error handling.
 - `my_agent/runtime/structured_loop.py`: structured tool-call loop and final-answer handling.
+- `my_agent/runtime/context_repetition.py`: schema-independent low-latency repetition fingerprints and bounded detection windows for iterative Agent contexts.
+- `my_agent/runtime/maintenance_sleep.py`: process-local continuation state and Main-Agent maintenance control boundary.
+- `my_agent/memory_engine/ltm/maintenance_pressure.py`: current maintainable-frontier pressure, progressive context notice, and hard threshold.
+- `my_agent/bridge/ui_bridge_server.py`: suspend/maintain/resume orchestration and failure retry/handoff Wake delivery.
 - `my_agent/commands/`: slash metadata, dispatch, and structured command execution.
 - `my_agent/tools/`: provider tool schemas, permission-aware runtime execution, and tool handlers.
 - `my_agent/security/`: confirmation and risk classification.
@@ -51,6 +57,17 @@ The bridge event inventory is in `my_agent/bridge/event_schema.py`, with matchin
 ## Memory Engine
 
 `my_agent/memory_engine/` is the single memory implementation. Cross-layer Event Stream, STM Projection, Working Memory, Focus Segments, Context Builder, dynamic budgets, evidence retrieval, and observer APIs remain in the parent package. LTM Core Store, formation, structured retrieval, Memory Push, query-driven Memory Retrieval, candidate generation, maintenance, and their model-backed services live under `my_agent/memory_engine/ltm/`.
+
+- `my_agent/memory_engine/stm_projection.py`: interaction-block semantics,
+  slot/tool-bundle projection units, and continuous STM suffix selection.
+- `my_agent/memory_engine/capacity_planner.py`: structural requirements,
+  shared budget-failure outcome, and one-pass stabilized capacity plan.
+- `my_agent/memory_engine/tool_ingress.py`: pre-append oversized tool-result
+  artifact and bounded-envelope guard.
+- `my_agent/memory_engine/wm/pins.py`: singleton current-turn pin lifecycle and
+  immutable-original rendering.
+- `my_agent/memory_engine/wm/working_memory.py`: normal WM maintenance and
+  proactive exact-slot SUM/bounded-REF recovery.
 
 `my_agent/memory_engine/ltm/retrieval_context_compiler.py` owns the Query Compiler stage for the three Memory Push channels and its strict output validation. `my_agent/memory_engine/ltm/candidate_generation.py` owns neutral lexical/embedding Candidate Pool generation; `my_agent/memory_engine/ltm/memory_push.py` is the Push orchestration wrapper. `my_agent/memory_engine/ltm/memory_retrieval.py` owns the process-local Retrieval Session, iterative Agent loop, candidate-pool tools, source Evidence validation, and continuation protocol. `my_agent/memory_engine/ltm/ltm_retrieval.py` owns profile-bound semantic and structured retrieval. `my_agent/memory_engine/ltm/memory_push_rank_1.py` owns shared Rank 1. `my_agent/memory_engine/ltm/memory_push_ranking.py` orchestrates Push Rank 1/2/3, while `my_agent/memory_engine/ltm/reranker_adapter.py` also exposes the caller-neutral Retrieval Rank 2 entry point. `my_agent/memory_engine/context_builder.py` injects the final temporary Memory Push projection into provider context; it does not persist the result.
 

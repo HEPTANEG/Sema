@@ -49,13 +49,52 @@ def _object_ref_schema():
     }
 
 
-def _payload_schema():
+def episode_structured_data_schema():
+    return {
+        "oneOf": [
+            {"type": "null"},
+            {
+                "type": "object",
+                "properties": {
+                    "time_scope": {
+                        "type": "object",
+                        "properties": {
+                            "start": {},
+                            "end": {},
+                            "anchor": {},
+                            "precision": {"type": "string", "enum": ["exact", "approximate", "relative"]},
+                        },
+                        "additionalProperties": False,
+                        "anyOf": [
+                            {"required": ["start"]},
+                            {"required": ["end"]},
+                            {"required": ["anchor"]},
+                        ],
+                    },
+                },
+                "additionalProperties": False,
+                "anyOf": [{"maxProperties": 0}, {"required": ["time_scope"]}],
+            },
+        ]
+    }
+
+
+def _empty_or_null_structured_data_schema():
+    return {
+        "oneOf": [
+            {"type": "null"},
+            {"type": "object", "maxProperties": 0, "additionalProperties": False},
+        ]
+    }
+
+
+def _payload_schema(structured_data_schema=None):
     return {
         "type": "object",
         "properties": {
             "schema_version": {"type": "integer", "enum": [1]},
             "body": {"type": "string"},
-            "structured_data": {"type": ["object", "null"], "additionalProperties": True},
+            "structured_data": structured_data_schema or {"type": ["object", "null"], "additionalProperties": True},
         },
         "required": ["schema_version"],
         "additionalProperties": False,
@@ -64,17 +103,38 @@ def _payload_schema():
 
 
 def _new_object_schema():
+    common = {
+        "temp_id": _string("Plan-local temp id for this new object."),
+        "title": _string("Short MemoryObject index label. Use 1-50 Runtime-counted tokens; put detailed facts in the payload."),
+        "summary": {
+            "type": ["string", "null"],
+            "description": (
+                "For payloads at or below 2048 UTF-8 bytes, use null. "
+                "For payloads above 2048 and at or below 8192 bytes, provide "
+                "a concise summary. Payloads above 8192 bytes must be split."
+            ),
+        },
+    }
+    required = ["temp_id", "object_type", "title", "payload"]
     return {
         "type": "object",
-        "properties": {
-            "temp_id": _string("Plan-local temp id for this new object."),
-            "object_type": {"type": "string", "enum": sorted(ltm_store.OBJECT_TYPES)},
-            "title": _string("MemoryObject title."),
-            "summary": {"type": ["string", "null"]},
-            "payload": _payload_schema(),
-        },
-        "required": ["temp_id", "object_type", "title", "payload"],
+        "properties": {**common, "object_type": {"type": "string", "enum": sorted(ltm_store.OBJECT_TYPES)}, "payload": _payload_schema()},
+        "required": required,
         "additionalProperties": False,
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {**common, "object_type": {"type": "string", "enum": ["assertion", "tag"]}, "payload": _payload_schema(_empty_or_null_structured_data_schema())},
+                "required": required,
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {**common, "object_type": {"type": "string", "enum": ["episode"]}, "payload": _payload_schema(episode_structured_data_schema())},
+                "required": required,
+                "additionalProperties": False,
+            },
+        ]
     }
 
 
@@ -108,7 +168,16 @@ def _link_schema():
         "type": "object",
         "properties": {
             "source": _object_ref_schema(),
-            "relation_type": {"type": "string", "enum": sorted(ltm_store.RELATION_TYPES)},
+            "relation_type": {
+                "type": "string",
+                "enum": sorted(ltm_store.RELATION_TYPES),
+                "description": (
+                    "Endpoint contract: sourced_from is MemoryObject -> Event Stream slot; "
+                    "tagged_with is MemoryObject -> tag; supports and contradicts require "
+                    "an assertion or episode source and an assertion target; supersedes is MemoryObject -> "
+                    "MemoryObject. Runtime validates existing object IDs and temp IDs."
+                ),
+            },
             "target": _link_target_schema(),
         },
         "required": ["source", "relation_type", "target"],
@@ -147,21 +216,21 @@ def maintenance_action_plan_schema():
         _intent_schema("replace", {"new_object": _new_object_schema(), "old_object_id": _string()}, ["new_object", "old_object_id"]),
         _intent_schema("merge", {"new_object": _new_object_schema(), "merged_object_ids": _string_array()}, ["new_object", "merged_object_ids"]),
         _intent_schema("split", {"old_object_id": _string(), "new_objects": {"type": "array", "items": _new_object_schema(), "minItems": 1}}, ["old_object_id", "new_objects"]),
-        _intent_schema("abstract", {"relation_type": {"type": "string", "enum": ["tagged_with"]}, "new_object": {**_new_object_schema(), "properties": {**_new_object_schema()["properties"], "object_type": {"type": "string", "enum": ["tag"]}}}, "source_object_ids": {**_string_array(), "minItems": 1}}, ["relation_type", "new_object", "source_object_ids"]),
-        _intent_schema("abstract", {"relation_type": {"type": "string", "enum": ["supports"]}, "new_object": {**_new_object_schema(), "properties": {**_new_object_schema()["properties"], "object_type": {"type": "string", "enum": ["assertion"]}}}, "source_object_ids": {**_string_array(), "minItems": 1}}, ["relation_type", "new_object", "source_object_ids"]),
+        _intent_schema("abstract", {"relation_type": {"type": "string", "enum": ["tagged_with"], "description": "Create a Tag and link every source object directly to that Tag. Sources may be any live MemoryObject type."}, "new_object": {**_new_object_schema(), "properties": {**_new_object_schema()["properties"], "object_type": {"type": "string", "enum": ["tag"]}}}, "source_object_ids": {**_string_array("Live MemoryObject IDs to tag directly."), "minItems": 1}}, ["relation_type", "new_object", "source_object_ids"]),
+        _intent_schema("abstract", {"relation_type": {"type": "string", "enum": ["supports"], "description": "Create an assertion supported by source assertions or episodes. Each source must be an assertion or episode; Tags are not valid sources."}, "new_object": {**_new_object_schema(), "properties": {**_new_object_schema()["properties"], "object_type": {"type": "string", "enum": ["assertion"]}}}, "source_object_ids": {**_string_array("IDs of existing source assertions or episodes. Do not use Tag IDs."), "minItems": 1}}, ["relation_type", "new_object", "source_object_ids"]),
         _intent_schema("retag", {"object_id": _string(), "add_tag_ids": _string_array(), "deactivate_tag_link_ids": _string_array()}, ["object_id"]),
         _intent_schema("relink", {"deactivate_link_ids": _string_array(), "create_links": {"type": "array", "items": _link_schema()}}, []),
         _intent_schema("mark_contradiction", {"source_object_id": _string(), "target_object_id": _string()}, ["source_object_id", "target_object_id"]),
         _intent_schema("resolve_contradiction", {"contradiction_link_ids": _string_array(), "resolution_links": {"type": "array", "items": _link_schema()}}, ["contradiction_link_ids"]),
         _intent_schema("mark_support", {"source_object_id": _string(), "target_object_id": _string()}, ["source_object_id", "target_object_id"]),
-        _intent_schema("update_title", {"object_id": _string(), "new_title": _string()}, ["object_id", "new_title"]),
+        _intent_schema("update_title", {"object_id": _string(), "new_title": _string("Short replacement title of 1-50 Runtime-counted tokens.")}, ["object_id", "new_title"]),
         _intent_schema("update_summary", {"object_id": _string(), "new_summary": {"type": ["string", "null"]}}, ["object_id", "new_summary"]),
     ]
     atomic_items = [
         _atomic_schema("create_object", {"new_object": _new_object_schema()}, ["new_object"]),
         _atomic_schema("create_link", {"link": _link_schema()}, ["link"]),
         _atomic_schema("deactivate_link", {"link_id": _string()}, ["link_id"]),
-        _atomic_schema("update_title", {"object_id": _string(), "new_title": _string()}, ["object_id", "new_title"]),
+        _atomic_schema("update_title", {"object_id": _string(), "new_title": _string("Short replacement title of 1-50 Runtime-counted tokens.")}, ["object_id", "new_title"]),
         _atomic_schema("update_summary", {"object_id": _string(), "new_summary": {"type": ["string", "null"]}}, ["object_id", "new_summary"]),
     ]
     return {
@@ -237,7 +306,7 @@ def _link(spec, mapping, links):
     links.append({"source": {"object_id": source}, "relation_type": spec.get("relation_type"), "target": target})
 
 
-def _intent(intent, mapping, objects, links, deactivations, updates, counters):
+def _intent(intent, mapping, objects, links, deactivations, updates, counters, root=None):
     kind = intent.get("intent_type")
     if kind not in INTENT_TYPES: raise CompileError(f"unsupported intent_type: {kind}")
     unknown = sorted(set(intent) - INTENT_ALLOWED_KEYS[kind])
@@ -260,12 +329,24 @@ def _intent(intent, mapping, objects, links, deactivations, updates, counters):
             raise CompileError("abstract relation_type must be tagged_with or supports")
         new_spec = intent.get("new_object") or {}
         expected_type = "tag" if relation == "tagged_with" else "assertion"
+        if new_spec.get("object_type") == "episode":
+            raise CompileError(
+                "abstract cannot create an episode; use atomic_operations with create_object "
+                "(object_type=episode) and create_link (relation_type=sourced_from) to its Event Stream slots."
+            )
         if new_spec.get("object_type") != expected_type:
             raise CompileError(f"abstract {relation} requires new_object.object_type={expected_type}")
         new_id = _new_object(new_spec, mapping, objects)
         sources = intent.get("source_object_ids") or []
         if not sources: raise CompileError("abstract requires source_object_ids")
-        for source in sources:
+        for index, source in enumerate(sources):
+            if relation == "supports":
+                source_object = ltm_store.get_object(source, root=root)
+                if source_object and source_object.get("object_type") not in {"assertion", "episode"}:
+                    raise CompileError(
+                        f"abstract supports source_object_ids[{index}] is {source_object.get('object_type')}; "
+                        "supports requires each source to be an assertion or episode. Tags cannot support assertions."
+                    )
             _link({"source_object_id": source, "relation_type": relation, "target_object_id": new_id}, mapping, links)
     elif kind == "retag":
         object_id = _ref(intent.get("object_id"), mapping)
@@ -294,6 +375,22 @@ def _atomic(operation, mapping, objects, links, deactivations, updates):
     else: updates.append({"field": "title" if kind == "update_title" else "summary", "object_id": _ref(operation.get("object_id"), mapping), "value": operation.get("new_title") if kind == "update_title" else operation.get("new_summary")})
 
 
+def _new_object_specs(plan):
+    specs = []
+    for intent in plan.get("intents") or []:
+        intent_type = intent.get("intent_type") if isinstance(intent, dict) else None
+        if intent_type in {"replace", "merge", "abstract"}:
+            if isinstance(intent.get("new_object"), dict):
+                specs.append(intent["new_object"])
+        elif intent_type == "split":
+            specs.extend(spec for spec in intent.get("new_objects") or [] if isinstance(spec, dict))
+    for operation in plan.get("atomic_operations") or []:
+        if isinstance(operation, dict) and operation.get("operation_type") == "create_object":
+            if isinstance(operation.get("new_object"), dict):
+                specs.append(operation["new_object"])
+    return specs
+
+
 def compile_maintenance_action_plan(plan, maintenance_run_id, plan_index, root=None):
     if not isinstance(plan, dict) or not isinstance(maintenance_run_id, str) or not maintenance_run_id:
         return {"status": "rejected", "errors": [{"code": "invalid_plan", "message": "plan and maintenance_run_id are required."}]}
@@ -305,7 +402,7 @@ def compile_maintenance_action_plan(plan, maintenance_run_id, plan_index, root=N
         return {"status": "rejected", "errors": [{"code": "empty_plan", "message": "intents or atomic_operations are required."}]}
     try:
         mapping, objects, links, deactivations, updates, counters = {}, [], [], [], [], Counter()
-        for intent in intents: _intent(intent, mapping, objects, links, deactivations, updates, counters)
+        for intent in intents: _intent(intent, mapping, objects, links, deactivations, updates, counters, root=root)
         for operation in atomics: _atomic(operation, mapping, objects, links, deactivations, updates)
         canonical_links, seen_links = [], set()
         for link in links:
@@ -327,6 +424,17 @@ def compile_maintenance_action_plan(plan, maintenance_run_id, plan_index, root=N
         unknown_links = sorted(link_id for link_id in deactivations if ltm_store.get_memory_link(link_id, root=root) is None)
         if unknown_links: raise CompileError(f"link references not found: {', '.join(unknown_links)}")
         plan_id = f"maintenance:{maintenance_run_id}:plan:{int(plan_index)}"
-        return {"status": "compiled", "plan_id": plan_id, "maintenance_run_id": maintenance_run_id, "plan_index": int(plan_index), "idempotency_key": plan_id, "objects": objects, "links": canonical_links, "deactivate_link_ids": deactivations, "updates": normalized_updates, "temp_id_map": mapping, "report_counter_hints": dict(counters), "errors": []}
+        object_targets = [{"kind": "object", "object_index": index, "target": {"temp_id": spec.get("temp_id")}}
+                          for index, spec in enumerate(_new_object_specs(plan))]
+        update_targets = [
+            {"kind": "update", "update_index": index, "target": {"object_id": update["object_id"]}}
+            for index, update in enumerate(normalized_updates)
+        ]
+        repair_targets = object_targets + update_targets
+        title_targets = object_targets + [
+            target for target, update in zip(update_targets, normalized_updates)
+            if update.get("field") == "title"
+        ]
+        return {"status": "compiled", "plan_id": plan_id, "maintenance_run_id": maintenance_run_id, "plan_index": int(plan_index), "idempotency_key": plan_id, "objects": objects, "links": canonical_links, "deactivate_link_ids": deactivations, "updates": normalized_updates, "temp_id_map": mapping, "title_targets": title_targets, "repair_targets": repair_targets, "report_counter_hints": dict(counters), "errors": []}
     except (CompileError, TypeError, ValueError) as error:
         return {"status": "rejected", "errors": [{"code": "compile_error", "message": str(error)}]}

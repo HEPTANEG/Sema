@@ -26,6 +26,9 @@ EXPECTED_REGISTERED_TOOL_NAMES = [
     "get_object",
     "retrieve_memory",
     "memorize",
+    "sleep_for_maintenance",
+    "retry_ltm_maintenance",
+    "return_maintenance_failure",
 ]
 
 HIDDEN_FROM_MODEL = {
@@ -33,6 +36,9 @@ HIDDEN_FROM_MODEL = {
     "list_images",
     "vision_analyze_images",
     "show_memory_state",
+    "sleep_for_maintenance",
+    "retry_ltm_maintenance",
+    "return_maintenance_failure",
 }
 
 EXPECTED_PROVIDER_TOOL_NAMES = [name for name in EXPECTED_REGISTERED_TOOL_NAMES if name not in HIDDEN_FROM_MODEL]
@@ -42,7 +48,7 @@ def test_tool_registry_names_are_stable():
     assert [definition.name for definition in tool_registry.TOOL_DEFINITIONS] == EXPECTED_REGISTERED_TOOL_NAMES
     assert tool_registry.tool_schema_names() == EXPECTED_PROVIDER_TOOL_NAMES
     assert tool_schemas.tool_schema_names() == EXPECTED_PROVIDER_TOOL_NAMES
-    assert len(tool_registry.TOOL_DEFINITIONS) == 21
+    assert len(tool_registry.TOOL_DEFINITIONS) == 24
 
 
 def test_tool_names_are_current_registry_names():
@@ -70,6 +76,9 @@ def test_tool_names_are_current_registry_names():
             "get_object",
             "retrieve_memory",
         "memorize",
+        "sleep_for_maintenance",
+        "retry_ltm_maintenance",
+        "return_maintenance_failure",
     ]
 
 

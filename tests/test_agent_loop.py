@@ -60,6 +60,31 @@ def test_answer_with_structured_tools_delegates_to_structured_loop(monkeypatch):
     assert messages[-1] == {"role": "assistant", "content": "delegated"}
 
 
+def test_maintenance_tools_follow_pressure_and_failed_continuation(monkeypatch):
+    from memory_engine.ltm import maintenance_pressure
+
+    def snapshot(value):
+        return {"pressure": value}
+
+    monkeypatch.setattr(maintenance_pressure, "maintenance_pressure_snapshot", lambda: snapshot(0.49))
+    names = {item["function"]["name"] for item in agent.tool_schemas_for_model({})}
+    assert "sleep_for_maintenance" not in names
+
+    monkeypatch.setattr(maintenance_pressure, "maintenance_pressure_snapshot", lambda: snapshot(0.5))
+    names = {item["function"]["name"] for item in agent.tool_schemas_for_model({})}
+    assert "sleep_for_maintenance" in names
+    assert "retry_ltm_maintenance" not in names
+
+    monkeypatch.setattr(maintenance_pressure, "maintenance_pressure_snapshot", lambda: snapshot(1.0))
+    names = {item["function"]["name"] for item in agent.tool_schemas_for_model({})}
+    assert names == {"sleep_for_maintenance"}
+
+    names = {item["function"]["name"] for item in agent.tool_schemas_for_model({
+        "maintenance_continuation": {"status": "failed", "failure_count": 2},
+    })}
+    assert names == {"retry_ltm_maintenance", "return_maintenance_failure"}
+
+
 def test_structured_plain_reply_is_appended_and_saved(monkeypatch):
     messages = _messages()
     saved = []
@@ -1177,149 +1202,51 @@ def test_context_limit_error_does_not_retry(monkeypatch):
     assert "model token limit" in messages[-1]["content"]
 
 
-def test_stm_context_build_error_becomes_final_answer(monkeypatch):
-    messages = _messages()
+def test_outbound_context_error_reports_oversized_external_user(monkeypatch):
+    from memory_engine.capacity_planner import CapacityLimitError
+
     calls = []
-    _patch_rendering(monkeypatch)
+    monkeypatch.setattr(
+        agent,
+        "context_status",
+        lambda messages, runtime_state=None: calls.append(list(messages)) or (_ for _ in ()).throw(
+            CapacityLimitError("stm", 60000, 50000, "reject_current_input")
+        ),
+    )
 
-    def fake_call(_messages, **_kwargs):
-        calls.append(True)
-        raise RuntimeError("STM latest interaction block exceeds budget: latest_block_tokens=12000, budget=10000.")
-
-    monkeypatch.setattr(agent, "call_model_with_tools", fake_call)
-    monkeypatch.setattr(agent, "save_last_session", lambda _messages: None)
-
-    agent.answer_with_tools(messages)
+    result = agent.outbound_context_error_message(_messages("oversized"), runtime_state={})
 
     assert len(calls) == 1
-    assert "Context build failed:" in messages[-1]["content"]
-    assert "STM V1 keeps complete interaction blocks only" in messages[-1]["content"]
+    assert "newest atomic STM unit" in result
+    assert "required_tokens=60000" in result
 
 
-def test_context_builder_error_becomes_final_answer(monkeypatch):
-    messages = _messages()
+def test_outbound_context_error_reports_wm_recovery_exhaustion(monkeypatch):
+    from memory_engine.capacity_planner import CapacityLimitError
+
+    monkeypatch.setattr(
+        agent,
+        "context_status",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            CapacityLimitError("wm", 60000, 50000, "compact_exact_slot")
+        ),
+    )
+
+    result = agent.outbound_context_error_message(_messages(), runtime_state={})
+
+    assert "Working Memory record" in result
+    assert "one exact-slot recovery attempt" in result
+
+
+def test_outbound_context_check_is_read_only_and_single_pass(monkeypatch):
     calls = []
-    _patch_rendering(monkeypatch)
-
-    def fake_call(_messages, **_kwargs):
-        calls.append(True)
-        raise RuntimeError("Context Builder WM slot exceeds budget: slot_seq=1, tokens=7000, budget=6000.")
-
-    monkeypatch.setattr(agent, "call_model_with_tools", fake_call)
-    monkeypatch.setattr(agent, "save_last_session", lambda _messages: None)
-
-    agent.answer_with_tools(messages)
-
-    assert len(calls) == 1
-    assert "Context build failed:" in messages[-1]["content"]
-    assert "overlarge working-memory slot" in messages[-1]["content"]
-
-
-def test_context_build_failure_saturates_budget_before_rebuild(monkeypatch):
-    messages = _messages("oversized")
-    attempts = []
-    recoveries = []
-    runtime_state = {}
-    _patch_rendering(monkeypatch)
-
-    def fake_messages_for_model(current, retrieval_plan=None, runtime_state=None):
-        attempts.append(list(current))
-        if len(attempts) == 1:
-            raise RuntimeError("STM latest interaction block exceeds budget: latest_block_tokens=12000, budget=10000.")
-        return current
-
-    monkeypatch.setattr(agent, "messages_for_model", fake_messages_for_model)
-    monkeypatch.setattr(agent, "attempt_preflight_working_memory_recovery", lambda error, current, state=None: recoveries.append((str(error), list(current))) or {"triggered": True, "updated": True, "reason": "preflight_recovery"})
-    monkeypatch.setattr(agent, "call_chat_completion", lambda *_args, **_kwargs: {"choices": [{"message": {"content": "Recovered.", "tool_calls": []}}]})
-    monkeypatch.setattr(agent, "parse_chat_completion_message", lambda data: data["choices"][0]["message"])
-    monkeypatch.setattr(agent, "save_last_session", lambda _messages: None)
-    monkeypatch.setattr(agent, "mark_assistant_turn_finished", lambda _runtime_state: None)
-    monkeypatch.setattr(agent, "schedule_final_answer_background_tasks", lambda _messages, _runtime_state=None: None)
-
-    agent.answer_with_tools(messages, runtime_state=runtime_state)
-
-    assert len(attempts) == 2
-    assert recoveries == []
-    assert "context_build_failure" not in runtime_state
-    assert messages[-1]["content"] == "Recovered."
-
-
-def test_context_build_failure_over_max_runs_preflight_wm(monkeypatch):
-    messages = _messages("oversized")
-    attempts = []
-    recoveries = []
-    _patch_rendering(monkeypatch)
-
-    def fake_messages_for_model(current, retrieval_plan=None, runtime_state=None):
-        attempts.append(list(current))
-        if len(attempts) == 1:
-            raise RuntimeError("STM latest interaction block exceeds budget: latest_block_tokens=60000, budget=10000.")
-        return current
-
-    monkeypatch.setattr(agent, "messages_for_model", fake_messages_for_model)
-    monkeypatch.setattr(agent, "attempt_preflight_working_memory_recovery", lambda error, current, state=None: recoveries.append((str(error), list(current))) or {"triggered": True, "updated": True, "reason": "preflight_recovery"})
-    monkeypatch.setattr(agent, "call_chat_completion", lambda *_args, **_kwargs: {"choices": [{"message": {"content": "Recovered.", "tool_calls": []}}]})
-    monkeypatch.setattr(agent, "parse_chat_completion_message", lambda data: data["choices"][0]["message"])
-    monkeypatch.setattr(agent, "save_last_session", lambda _messages: None)
-    monkeypatch.setattr(agent, "mark_assistant_turn_finished", lambda _runtime_state: None)
-    monkeypatch.setattr(agent, "schedule_final_answer_background_tasks", lambda _messages, _runtime_state=None: None)
-
-    agent.answer_with_tools(messages, runtime_state={})
-
-    assert len(attempts) == 2
-    assert len(recoveries) == 1
-    assert recoveries[0][1] == _messages("oversized")
-    assert messages[-1]["content"] == "Recovered."
-
-
-def test_outbound_context_error_preflight_recovers(monkeypatch):
-    messages = _messages("oversized")
-    attempts = []
-    recoveries = []
-
-    def fake_messages_for_model(current, runtime_state=None):
-        attempts.append(list(current))
-        if len(attempts) == 1:
-            raise RuntimeError("STM latest interaction block exceeds budget: latest_block_tokens=60000, budget=10000.")
-        return current
-
-    monkeypatch.setattr(agent, "messages_for_model", fake_messages_for_model)
-    monkeypatch.setattr(agent, "attempt_preflight_working_memory_recovery", lambda error, current, state=None: recoveries.append((str(error), list(current))) or {"triggered": True, "updated": True, "reason": "preflight_recovery"})
-
-    result = agent.outbound_context_error_message(messages, runtime_state={})
-
-    assert result == ""
-    assert len(attempts) == 2
-    assert len(recoveries) == 1
-
-
-def test_outbound_context_error_marks_preflight_and_restores_state(monkeypatch):
-    phases = []
-
-    def fake_messages_for_model(_current, runtime_state=None):
-        phases.append(runtime_state.get("_context_build_phase"))
-        return []
-
-    monkeypatch.setattr(agent, "messages_for_model", fake_messages_for_model)
-    runtime_state = {}
+    runtime_state = {"sentinel": "unchanged"}
+    monkeypatch.setattr(agent, "context_status", lambda messages, runtime_state=None: calls.append(list(messages)) or {})
 
     assert agent.outbound_context_error_message(_messages(), runtime_state) == ""
-    assert phases == ["preflight"]
-    assert "_context_build_phase" not in runtime_state
-
-
-def test_outbound_context_error_restores_preexisting_phase_on_error(monkeypatch):
-    def fail(_current, runtime_state=None):
-        assert runtime_state["_context_build_phase"] == "preflight"
-        raise ValueError("context check failed")
-
-    monkeypatch.setattr(agent, "messages_for_model", fail)
-    runtime_state = {"_context_build_phase": "outer"}
-
-    with pytest.raises(ValueError, match="context check failed"):
-        agent.outbound_context_error_message(_messages(), runtime_state)
-
-    assert runtime_state["_context_build_phase"] == "outer"
+    assert len(calls) == 1
+    assert runtime_state == {"sentinel": "unchanged"}
+    assert not hasattr(agent, "attempt_preflight_working_memory_recovery")
 
 
 def test_run_command_tool_requires_confirmation(monkeypatch):

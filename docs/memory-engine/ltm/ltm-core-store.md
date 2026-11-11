@@ -120,6 +120,15 @@ payload > 8 KiB           write is rejected; split into objects
 
 The Store does not split content or generate summaries.
 
+For `episode` objects, `structured_data` is either `null`, an empty object
+(stored as `null`), or an object containing only `time_scope`. `time_scope`
+allows `start`, `end`, `anchor`, and optional `precision`; at least one of
+`start`, `end`, or `anchor` must be non-empty, and `precision` is one of
+`exact`, `approximate`, or `relative`. The Store rejects unknown fields,
+empty time scopes, and invalid precision values without guessing or silently
+removing them. Assertion and Tag objects retain their existing empty-or-null
+structured-data compatibility.
+
 ## MemoryLink
 
 Each Link has one MemoryObject source and one target:
@@ -218,8 +227,9 @@ Successful use is counted only when a MemoryObject appears in a final valid
 Recall result or is actually injected into provider context by LTM Push.
 Candidate hits, FTS hits, semantic hits, and Rank inputs do not count.
 
-Physical schema version 10 and Strength formula version 2 introduce forgetting;
-Payload schema version remains 1. New objects start at the current library slot
+Physical schema version 11 contains the forgetting and maintenance-runtime
+state migrations; Strength formula version 2 introduces the forgetting
+calculation. Payload schema version remains 1. New objects start at the current library slot
 (empty stream: -1), not their provenance slot. Legacy objects receive a full
 rollout buffer from the migration slot, preserving use counts without inventing
 historical last-use records. Effective-use idempotent transactions also record
@@ -332,7 +342,12 @@ Vector synchronization uses a staged commit path:
 3. install staged Vector artifacts;
 4. mark the journal complete.
 
-Embedding or Vector failures reject the LTM write. Store initialization first
+Embedding or Vector failures reject the LTM write. Maintenance Plan staging has
+a bounded embedding timeout and reports `vector_sync_timeout` separately from
+other `vector_sync` failures; a timed-out local Embedding Service is closed.
+Native staged mutations are executed by an isolated worker with a timeout;
+worker failure leaves the installed index and canonical rows untouched.
+Store initialization first
 recovers prepared Vector journals. If recovery cannot establish consistency,
 the Store fails closed instead of allowing reads or writes against a possibly
 inconsistent LTM.

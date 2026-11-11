@@ -18,6 +18,14 @@ The runtime strategy has two objectives:
 2. avoid repeating complete work during a continuous conversation while still
    considering every current user message.
 
+Foreground Memory Push has a single 60-second end-to-end time budget, including
+first-use startup of the local embedding or reranker services. The deadline is
+propagated through query compilation, candidate generation, ranking, and
+provider calls. When it expires, the push fails open: its metadata-only
+diagnostic is retained for runtime inspection, but no failure placeholder is
+injected into the current Main Agent context. Background full refreshes are not
+subject to this foreground deadline.
+
 ## Current Performance Measures
 
 Each real `run_memory_push()` call records temporary metadata-only diagnostics
@@ -280,5 +288,4 @@ implemented contract:
 - graph or temporal candidate expansion;
 - cache-based Rank reuse beyond the confirmed incremental
   rules;
-- a fixed end-to-end latency target;
 - proactive Payload-overflow handling.

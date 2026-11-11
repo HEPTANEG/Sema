@@ -25,6 +25,15 @@ def build_memory_engine_state(messages=None, runtime_state=None):
     budgets = pressure.get("budgets") or {}
     stm_budget = int(budgets.get("stm") or STM_TOKEN_BUDGET)
     wm_budget = int(budgets.get("wm") or WM_TOKEN_BUDGET_FALLBACK)
+    planned = {}
+    try:
+        from .context_builder import context_status
+
+        planned = context_status(messages or [], runtime_state=runtime_state)
+        stm_budget = int(planned.get("stm_budget") or stm_budget)
+        wm_budget = int(planned.get("wm_budget") or wm_budget)
+    except Exception:
+        planned = {}
     watermark = _watermark_state(db_path, runtime_state)
     stm = _stm_state(messages, stm_budget, watermark["effective_watermark"])
     working_memory = _working_memory_state(db_path, stm, wm_budget)
@@ -34,14 +43,17 @@ def build_memory_engine_state(messages=None, runtime_state=None):
         "storage": storage,
         "context": {
             "context_order": ["system", "working_memory", "long_term_memory", "short_term_memory"],
-            "budget_source": pressure.get("budget_source") or "unavailable",
+            "budget_source": planned.get("budget_source") or pressure.get("budget_source") or "unavailable",
             "stm_budget": stm_budget,
-            "stm_raw_budget": budgets.get("stm_raw", budgets.get("stm", "unavailable")),
-            "stm_budget_range": _range_text(budgets.get("stm_min"), budgets.get("stm_max")),
+            "stm_raw_budget": planned.get("stm_raw_budget", budgets.get("stm_raw", budgets.get("stm", "unavailable"))),
+            "stm_budget_range": _range_text(planned.get("stm_min", budgets.get("stm_min")), planned.get("stm_max", budgets.get("stm_max"))),
             "wm_budget": wm_budget,
-            "wm_raw_budget": budgets.get("wm_raw", budgets.get("wm", "unavailable")),
-            "wm_budget_range": _range_text(budgets.get("wm_min"), budgets.get("wm_max")),
+            "wm_raw_budget": planned.get("wm_raw_budget", budgets.get("wm_raw", budgets.get("wm", "unavailable"))),
+            "wm_budget_range": _range_text(planned.get("wm_min", budgets.get("wm_min")), planned.get("wm_max", budgets.get("wm_max"))),
             "total_estimated_context_tokens": "unavailable",
+            "capacity": planned.get("capacity") or pressure.get("capacity") or {},
+            "failure_count": planned.get("failure_count", (pressure.get("failure") or {}).get("continuous_session_context_budget_failure_count", 0)),
+            "f_failure": planned.get("f_failure", (pressure.get("failure") or {}).get("f_failure", 0)),
         },
         "stm": stm,
         "working_memory": working_memory,
@@ -81,13 +93,16 @@ def format_memory_engine_state(state):
         f"  wm_raw_budget: {context.get('wm_raw_budget', 'unavailable')}",
         f"  wm_budget_range: {context.get('wm_budget_range', 'unavailable')}",
         f"  total_estimated_context_tokens: {context.get('total_estimated_context_tokens', 'unavailable')}",
+        f"  failure_count: {context.get('failure_count', 0)}",
+        f"  f_failure: {context.get('f_failure', 0)}",
+        f"  capacity_recovery_action: {(context.get('capacity') or {}).get('capacity_recovery_action', 'none')}",
         "- Short-Term Memory:",
-        f"  selected_block_count: {stm.get('selected_block_count', 'unavailable')}",
-        f"  omitted_block_count: {stm.get('omitted_block_count', 'unavailable')}",
+        f"  selected_unit_count: {stm.get('selected_unit_count', 'unavailable')}",
+        f"  omitted_unit_count: {stm.get('omitted_unit_count', 'unavailable')}",
         f"  selected_tokens: {stm.get('selected_tokens', 'unavailable')}",
-        f"  latest_block_tokens: {stm.get('latest_block_tokens', 'unavailable')}",
+        f"  latest_unit_tokens: {stm.get('latest_unit_tokens', 'unavailable')}",
         f"  wm_ingress_watermark: {watermark.get('effective_watermark', -1)}",
-        f"  watermark_locked_omitted_block_count: {stm.get('watermark_locked_omitted_block_count', 'unavailable')}",
+        f"  watermark_locked_omitted_unit_count: {stm.get('watermark_locked_omitted_unit_count', 'unavailable')}",
         "- Working Memory:",
         f"  active_raw_count: {wm.get('active_raw_count', 0)}",
         f"  active_ref_count: {wm.get('active_ref_count', 0)}",
@@ -146,12 +161,12 @@ def _stm_state(messages, budget, watermark):
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
     return {
-        "selected_block_count": len(projection.get("selected_blocks") or []),
-        "omitted_block_count": len(projection.get("omitted_blocks") or []),
+        "selected_unit_count": len(projection.get("selected_units") or []),
+        "omitted_unit_count": len(projection.get("omitted_units") or []),
         "selected_tokens": projection.get("selected_tokens", 0),
-        "latest_block_tokens": projection.get("latest_block_tokens", 0),
-        "watermark_locked_omitted_block_count": projection.get("watermark_locked_omitted_block_count", 0),
-        "omitted_blocks": projection.get("omitted_blocks") or [],
+        "latest_unit_tokens": projection.get("latest_unit_tokens", 0),
+        "watermark_locked_omitted_unit_count": projection.get("watermark_locked_omitted_unit_count", 0),
+        "omitted_units": projection.get("omitted_units") or [],
     }
 
 
@@ -166,7 +181,13 @@ def _working_memory_state(db_path, stm, budget):
         "active_sum_tokens": 0,
         "candidate_count": 0,
     }
-    omitted_ranges = [(int(block["start_index"]), int(block["end_index"])) for block in stm.get("omitted_blocks") or []]
+    try:
+        from .wm.pins import pin_status
+
+        state["current_turn_pin"] = pin_status()
+    except Exception:
+        state["current_turn_pin"] = {"active": False}
+    omitted_ranges = [(int(unit["start_index"]), int(unit["end_index"])) for unit in stm.get("omitted_units") or []]
     with _read_connection(db_path) as connection:
         if connection is None or not _has_table(connection, "slots") or not _has_table(connection, "events"):
             return state

@@ -35,6 +35,7 @@ from ..token_counter import count_message_tokens, count_text_tokens
 RANK_1_MAX_ITEMS = 400
 RANK_2_MAX_ITEMS = 80
 RANK_3_MAX_ITEMS = 40
+MEMORY_PUSH_DEADLINE_ERROR = "Memory Push exceeded its foreground time budget."
 
 
 STM_MAX_TOKENS = 1_024
@@ -76,6 +77,8 @@ def _failure_reason(metrics, error):
         return metrics["reason_code"]
     stage = metrics.get("stage") or "memory_push"
     message = str(error or "").lower()
+    if "foreground time budget" in message:
+        return "deadline_exceeded"
     if stage == "query_compilation":
         return "query_compilation_failed"
     if stage == "candidate_pool":
@@ -166,6 +169,20 @@ def prepare_rank_2_candidates(candidates, max_tokens=CANDIDATE_MAX_TOKENS):
     return prepared
 
 
+def _remaining_timeout(runtime_state):
+    deadline = (runtime_state or {}).get("_memory_push_deadline") if isinstance(runtime_state, dict) else None
+    if deadline is None:
+        return 120
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError(MEMORY_PUSH_DEADLINE_ERROR)
+    return max(1, int(remaining))
+
+
+def _check_deadline(runtime_state):
+    _remaining_timeout(runtime_state)
+
+
 def _rank_3_json_response(runtime_state, messages):
     if isinstance(runtime_state, dict):
         responses = runtime_state.get("eval_memory_push_rank_3_responses")
@@ -201,11 +218,12 @@ def _rank_3_json_response(runtime_state, messages):
             provider_timing["first_content_ms"] = (time.perf_counter() - provider_started) * 1000
 
     try:
+        timeout_seconds = _remaining_timeout(runtime_state)
         response = call_chat_completion_stream(
             messages,
             tools=None,
             temperature=0,
-            timeout_seconds=120,
+            timeout_seconds=timeout_seconds,
             purpose="memory push rank 3",
             on_delta=on_delta,
             on_headers=on_headers,
@@ -473,6 +491,7 @@ def run_memory_push(
     try:
         metrics["mode"] = mode
         metrics["stage"] = "query_compilation"
+        _check_deadline(runtime_state)
         _trace_metrics(runtime_state, metrics)
         _emit_memory_push_stage(runtime_state, "Generating memory retrieval queries")
         contexts = retrieval_context_compiler.build_channel_contexts(stm_messages, wm_messages)
@@ -485,6 +504,7 @@ def run_memory_push(
             if channels:
                 compiled = retrieval_context_compiler.compile_retrieval_queries(
                     contexts,
+                    timeout_seconds=_remaining_timeout(runtime_state),
                     channels=channels,
                     trajectory_context=push_span,
                     _diagnostic_profiler=profiler,
@@ -492,6 +512,7 @@ def run_memory_push(
             else:
                 compiled = retrieval_context_compiler.compile_retrieval_queries(
                     contexts,
+                    timeout_seconds=_remaining_timeout(runtime_state),
                     trajectory_context=push_span,
                     _diagnostic_profiler=profiler,
                 )
@@ -507,10 +528,16 @@ def run_memory_push(
             if isinstance(channel, dict) and isinstance(channel.get("queries"), list)
         )
         metrics["stage"] = "candidate_pool"
+        _check_deadline(runtime_state)
         _trace_metrics(runtime_state, metrics)
         _emit_memory_push_stage(runtime_state, "Searching long-term memory")
         with profiler.measure("candidate_pool_ms"):
-            pool = memory_push.build_candidate_pool(compiled, root=root, _diagnostic_profiler=profiler)
+            pool = memory_push.build_candidate_pool(
+                compiled,
+                root=root,
+                _diagnostic_profiler=profiler,
+                deadline=(runtime_state or {}).get("_memory_push_deadline"),
+            )
         metrics["candidate_pool_count"] = len(pool.get("items") or [])
         record_event(
             push_span,
@@ -572,11 +599,13 @@ def run_memory_push(
                     return cached
                 return _empty_result(metrics, reason="empty_incremental_result", candidate_pool=pool)
             metrics["stage"] = "object_hydration"
+            _check_deadline(runtime_state)
             with profiler.measure("object_hydration_ms"):
                 recheck_objects = _full_objects([{"object_id": item["object_id"]} for item in recheck_items], root=root)
             if not recheck_objects:
                 return _baseline_result(baseline) or _empty_result(metrics, reason="no_hydrated_objects", candidate_pool=pool)
             metrics["stage"] = "rank_3"
+            _check_deadline(runtime_state)
             _trace_metrics(runtime_state, metrics)
             _emit_memory_push_stage(runtime_state, "Selecting long-term memory")
             rank_3_messages, references = _rank_3_messages(rank_3_context, recheck_objects)
@@ -621,10 +650,12 @@ def run_memory_push(
             _trace_metrics(runtime_state, metrics)
             _emit_memory_push_stage(runtime_state, "Rank 2: Ranking long-term memory")
             with profiler.measure("rank_2_ms"):
+                _check_deadline(runtime_state)
                 rank_2 = rank_2_candidates(
                     stm_messages,
                     rank_2_input,
                     max_items=RANK_2_MAX_ITEMS,
+                    timeout_seconds=_remaining_timeout(runtime_state),
                     _diagnostic_profiler=profiler,
                 )
             if rank_2.get("status") != "ok":
@@ -635,11 +666,13 @@ def run_memory_push(
         if not rank_2_ids:
             return _empty_result(metrics, reason="empty_rank_2_result", candidate_pool=pool)
         metrics["stage"] = "object_hydration"
+        _check_deadline(runtime_state)
         with profiler.measure("object_hydration_ms"):
             objects = _full_objects([{"object_id": object_id} for object_id in rank_2_ids], root=root)
         if not objects:
             return _empty_result(metrics, reason="no_hydrated_objects", candidate_pool=pool)
         metrics["stage"] = "rank_3"
+        _check_deadline(runtime_state)
         _trace_metrics(runtime_state, metrics)
         _emit_memory_push_stage(runtime_state, "Rank 3: Selecting long-term memory")
         rank_3_messages, references = _rank_3_messages(rank_3_context, objects)

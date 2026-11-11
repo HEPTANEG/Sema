@@ -54,7 +54,7 @@ bridge regressions plus the full Python and TUI suites and TUI build.
 
 ## Formation Write-Plan Repair
 
-`tests/test_ltm_formation.py` checks title-limit prompt visibility, measured
+`tests/test_ltm_formation.py` checks title-limit and Episode-schema prompt visibility, measured
 Payload/title feedback, two independent correction requests after normal rounds
 are exhausted, retrieval tool omission and rejection during repair, atomic
 failure, mixed-error rejection, and valid `no_memory`. The existing summary,
@@ -95,12 +95,51 @@ release. Use mocked providers and temporary stores; no production memory is used
 ## Maintainer Staged Execution and Completion Wake
 
 `tests/test_ltm_maintenance_staged.py` verifies the ordered semantic stages,
-relevant-read evidence gates, exclusive stage reports, 500-token summaries,
-legacy-summary exclusion, mechanical summary composition, and completion Wake
-payloads. Stage summaries are tested with mock providers and temporary stores;
+relevant-read evidence gates, exclusive stage reports, the 500-token prompt
+target with a 1,000-token Runtime tolerance, legacy-summary exclusion,
+mechanical summary composition, and completion Wake payloads. Stage summaries
+are tested with mock providers and temporary stores;
 the tests do not start model, embedding, or reranker services. The Wake is
 asserted as `source=maintainer`, `kind=maintenance_completed`, and
 `processing_class=tool_result_like`.
+
+## Maintainer Plan Repair and Partial Commit
+
+Maintainer plan tests verify that title, summary, and Episode structured-data
+errors report the field path and measured limits; the first rejection creates
+an invocation-local draft; and `repair_maintenance_plan` can change only
+Runtime-marked fields. A corrected draft is recompiled and committed as one
+complete plan without truncating or guessing fields. A second supported failure may
+commit independent valid units while skipping the invalid object and its
+dependent links, preserving a repair draft for the skipped units. Tests also
+verify intent atomicity and that malformed JSON, top-level schema errors,
+duplicate temp IDs, idempotency conflicts, oversized payloads, and unsupported
+errors do not enter
+partial-commit mode. Use mocked providers and temporary stores; do not run
+these cases against a production memory library.
+
+## Maintainer Plan Commit Diagnostics and Restart Recovery
+
+The Maintainer Store tests verify Runtime-only commit phase events, bounded
+embedding timeout results and cleanup, schema migration of the maintenance
+owner/heartbeat fields, and replacement of a `running` run whose owner process
+has exited. Tests also verify that committed-plan checkpoints are retained and
+that the interrupted trajectory is marked failed before the replacement run is
+started. These tests use temporary Stores, mocked vector staging and mocked
+Embedding Service behavior; they do not start a live model or embedding
+process.
+
+`tests/test_vector_index.py` checks isolated staging, abnormal worker exit,
+timeout, preservation of the installed index and normal staged installation.
+
+## Main-Agent Maintenance Sleep and Resume
+
+Run `python -m pytest -q tests/test_agent_loop.py tests/test_maintenance_sleep_gate.py tests/test_ui_bridge.py tests/test_context_builder.py tests/test_retrieval_async_wake.py tests/test_ltm_maintenance_runner.py`.
+These tests cover pressure-based tool availability, input admission at the hard
+threshold, turn-lock release before maintenance starts, continuation failure
+attempt metadata, same-continuation chained maintenance cycles, and existing
+Wake behavior. Add or update mocked-provider cases when changing the suspended
+task or retry/handoff contract. No live model or production Store is used.
 
 ## Maintainer Formation-Buffer Boundary
 
@@ -111,9 +150,9 @@ pressure counts only the maintainable backlog. Formation tests continue to
 verify that its own WM-overlap writes are unchanged. Use temporary Event Stream
 and Store roots with mocked providers and fake embeddings.
 
-## Maintainer Keyword Search and Repetition Recovery
+## Maintainer Keyword Search and Context Repetition Detection
 
-Run `python -m pytest -q tests/test_ltm_maintenance_observation.py tests/test_ltm_maintenance_runner.py tests/test_bridge_event_schema.py` with mock providers and temporary stores. Coverage includes literal OR queries, distinct-term ranking before limits, short terms, stable ties, warning at round three, failure at round five, changed observations, and same-run recovery. Run Raven gateway event tests for isolated warning rendering and terminal busy release, followed by the TUI suite and build. No live model or embedding services are required.
+Run `python -m pytest -q tests/test_context_repetition.py tests/test_ltm_maintenance_observation.py tests/test_ltm_maintenance_runner.py tests/test_bridge_event_schema.py` with mock providers and temporary stores. Coverage includes literal OR queries, distinct-term ranking before limits, short terms, stable ties, exact and near-duplicate model outputs, the ten-output window, warnings at rounds three, five, and eight, stage boundaries, Tool-result exclusion, diagnostic persistence, and the absence of automatic failure. Run Raven gateway event tests for isolated warning rendering and terminal busy release, followed by the TUI suite and build. No live model or embedding services are required.
 
 The default TUI configuration excludes Raven tests. From `tui`, run them with
 `node --input-type=module -e "import {startVitest} from 'vitest/node'; const ctx=await startVitest('test',['src/raven/__tests__/createGatewayEventHandler.test.ts','src/raven/__tests__/turnController'],{config:false,watch:false}); await ctx.close();"`.
@@ -159,7 +198,7 @@ npm run build --prefix tui
 
 - Runtime, bridge, command, tool, persistence, skill, and provider suites verify user-visible agent behavior.
 - Deterministic runtime clock and rhythm tests verify process timing, continuous-session boundaries, assistant finish markers, `/time`, and current-clock provider injection.
-- Memory Engine suites cover Event Stream persistence, STM, Working Memory, Focus Segments, Context Builder, dynamic budgets, observer metadata, LTM storage, retrieval, automatic Formation, Memorize, Memory Push Candidate Pool, Rank 1/2/3, and per-turn Context Builder injection.
+- Memory Engine suites cover Event Stream persistence, STM, Working Memory, Focus Segments, Context Builder, dynamic budgets, observer metadata, LTM storage, retrieval, automatic Formation, Memorize, Memory Push Candidate Pool, Rank 1/2/3, per-turn Context Builder injection, and foreground Memory Push deadline fail-open behavior.
 - Embedding Service tests use a fake model for normal regression. The real BGE-M3 process smoke test is opt-in with `SEMA_EMBEDDING_SMOKE=1` and requires the user-level model cache. Vector Index tests use the installed `usearch` adapter and temporary project roots; they cover persistence, stable ordering, removal, rebuild, dirty-index handling, and Core Store synchronization. Memory Push Candidate Pool tests cover the three channel input boundaries, parallel query compilation, strict query validation, the independent `memory_push` Retrieval Profile, semantic and lexical adapters, Root Tag exclusion, raw score preservation, and deterministic object-id integration.
 - Tests import canonical package paths such as `runtime.agent`, `persistence.session`, `tools.tool_schemas`, and `bridge.ui_bridge_server`.
 - Unified Trajectory tests use temporary project roots and mocked provider exchanges. They cover SQLite schema and ordering, nested and resumable process roots, complete gzip artifact round trips and reuse, retention, legacy trace/context migration, Provider finish reasons and interrupted streams, process instrumentation, and `/trajectory` commands. They must not call live model, embedding, or reranker services.
